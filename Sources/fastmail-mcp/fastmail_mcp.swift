@@ -26,11 +26,25 @@ private enum MCPError: Error, CustomStringConvertible {
         case .authError(let m): return m
         }
     }
+
+    /// Standard JSON-RPC error codes
+    var jsonRPCCode: Int {
+        switch self {
+        case .invalidRequest: return -32600
+        case .methodNotFound: return -32601
+        case .invalidParams: return -32602
+        case .toolNotFound:  return -32601
+        case .toolError:     return -32000
+        case .authError:     return -32000
+        }
+    }
 }
 
 // MARK: - JMAP Session & HTTP Helpers
 
 /// Cached session: apiUrl + per-capability accountId map + the raw primaryAccounts dict.
+/// All access is serialized through sessionLock.
+private let sessionLock = NSLock()
 private var cachedSessionApiUrl: String?
 private var cachedPrimaryAccounts: [String: String] = [:]  // capability → accountId
 private var cachedFallbackAccountId: String?
@@ -45,6 +59,9 @@ private func bearerToken() throws -> String {
 /// Discover the JMAP session. Caches the full session for the process lifetime.
 /// Returns the apiUrl and the primary accountId for the requested capability.
 private func sessionFor(using capabilities: [String]) throws -> (apiUrl: String, accountId: String) {
+    sessionLock.lock()
+    defer { sessionLock.unlock() }
+
     if cachedSessionApiUrl == nil {
         let token = try bearerToken()
         let url = URL(string: "https://api.fastmail.com/jmap/session")!
@@ -256,7 +273,7 @@ private func listEmails(params: [String: Any]) throws -> Any {
     guard let mailboxId = params["mailboxId"] as? String, !mailboxId.isEmpty else {
         throw MCPError.invalidParams("mailboxId is required")
     }
-    let limit = params["limit"] as? Int ?? 20
+    let limit = min(params["limit"] as? Int ?? 20, 200)
     let offset = params["offset"] as? Int ?? 0
     let onlyUnread = params["onlyUnread"] as? Bool ?? false
 
@@ -346,7 +363,7 @@ private func searchEmails(params: [String: Any]) throws -> Any {
     guard let query = params["query"] as? String, !query.isEmpty else {
         throw MCPError.invalidParams("query is required")
     }
-    let limit = params["limit"] as? Int ?? 20
+    let limit = min(params["limit"] as? Int ?? 20, 200)
     let mailboxId = params["mailboxId"] as? String
 
     let acct = try accountId()
@@ -485,22 +502,24 @@ private func sendEmail(params: [String: Any]) throws -> Any {
         }
     }
 
-    // Find Drafts mailbox — required for mailboxIds
+    // Find Drafts and Sent mailboxes
     let mbResponses = try jmapCall([
-        ["Mailbox/query", ["accountId": acct, "filter": ["role": "drafts"]], "mq0"],
         ["Mailbox/get", [
             "accountId": acct,
-            "#ids": ["resultOf": "mq0", "name": "Mailbox/query", "path": "/ids"],
-            "properties": ["id", "name"]
+            "properties": ["id", "name", "role"]
         ], "mg0"]
     ])
     var draftsId: String?
-    if let mbResp = mbResponses.last, mbResp.count >= 2,
+    var sentId: String?
+    if let mbResp = mbResponses.first, mbResp.count >= 2,
        let mbData = mbResp[1] as? [String: Any],
-       let mbList = mbData["list"] as? [[String: Any]],
-       let draftsMb = mbList.first,
-       let id = draftsMb["id"] as? String, !id.isEmpty {
-        draftsId = id
+       let mbList = mbData["list"] as? [[String: Any]] {
+        for mb in mbList {
+            let role = mb["role"] as? String
+            let id = mb["id"] as? String
+            if role == "drafts" { draftsId = id }
+            if role == "sent" { sentId = id }
+        }
     }
     guard let draftsMbId = draftsId else {
         throw MCPError.toolError("Could not find Drafts mailbox — required for sending")
@@ -510,26 +529,37 @@ private func sendEmail(params: [String: Any]) throws -> Any {
     // Create email and submit in one call.
     // Use JMAP creation references: "#emailId" with ResultReference pointing
     // to the created object's server-assigned id from Email/set.
+    // On success, move from Drafts to Sent (or just remove Drafts keyword).
     let createId = "draft"
+    var submissionArgs: [String: Any] = [
+        "accountId": acct,
+        "create": ["sub0": [
+            "identityId": identityId,
+            "#emailId": [
+                "resultOf": "c0",
+                "name": "Email/set",
+                "path": "/created/\(createId)/id"
+            ]
+        ] as [String: Any]]
+    ]
+    // Move to Sent folder on success; fall back to destroying draft if no Sent folder
+    if let sentMbId = sentId {
+        submissionArgs["onSuccessUpdateEmail"] = [
+            "#\(createId)": [
+                "mailboxIds": [sentMbId: true],
+                "keywords/$draft": nil
+            ] as [String: Any?]
+        ]
+    } else {
+        submissionArgs["onSuccessDestroyEmail"] = ["#\(createId)"]
+    }
+
     let responses = try jmapCall([
         ["Email/set", [
             "accountId": acct,
             "create": [createId: emailObj]
         ], "c0"],
-        ["EmailSubmission/set", [
-            "accountId": acct,
-            "onSuccessDestroyEmail": [
-                "#\(createId)"  // Fastmail extension: resolves creation id reference
-            ],
-            "create": ["sub0": [
-                "identityId": identityId,
-                "#emailId": [
-                    "resultOf": "c0",
-                    "name": "Email/set",
-                    "path": "/created/\(createId)/id"
-                ]
-            ] as [String: Any]]
-        ], "s0"]
+        ["EmailSubmission/set", submissionArgs, "s0"]
     ], using: [
         "urn:ietf:params:jmap:core",
         "urn:ietf:params:jmap:mail",
@@ -808,7 +838,7 @@ private func ackBridgeMessage(params: [String: Any]) throws -> Any {
 // ── Contacts Tools ───────────────────────────────────────────────────────────
 
 private func listContacts(params: [String: Any]) throws -> Any {
-    let limit = params["limit"] as? Int ?? 50
+    let limit = min(params["limit"] as? Int ?? 50, 200)
     let search = params["search"] as? String
 
     let caps = [
@@ -1215,7 +1245,7 @@ private let tools: [ToolDefinition] = [
     ),
     ToolDefinition(
         name: "fm_ack_bridge_message",
-        description: "Acknowledge a bridge message: mark as read and move to Bridge/Processed.",
+        description: "Acknowledge a bridge message: mark as read and move to Bridge/Processed. Provide either 'ids' (array) or 'id' (single string).",
         inputSchema: [
             "type": "object",
             "properties": [
@@ -1224,7 +1254,11 @@ private let tools: [ToolDefinition] = [
                 "mailboxName": ["type": "string", "description": "Bridge mailbox name (default: 'Bridge')"],
                 "processedMailboxName": ["type": "string", "description": "Processed subfolder name (default: 'Bridge/Processed')"]
             ] as [String: Any],
-            "required": []
+            "required": [],
+            "anyOf": [
+                ["required": ["ids"]],
+                ["required": ["id"]]
+            ] as [[String: Any]]
         ]
     ),
 
@@ -1345,7 +1379,7 @@ private class MCPServer {
                 throw MCPError.methodNotFound("Method not found: \(method)")
             }
         } catch let e as MCPError {
-            sendError(id: id, code: -32000, message: e.description)
+            sendError(id: id, code: e.jsonRPCCode, message: e.description)
         } catch {
             sendError(id: id, code: -32000, message: error.localizedDescription)
         }
@@ -1358,9 +1392,11 @@ private class MCPServer {
     }
 
     private func sendError(id: Any?, code: Int, message: String) {
+        // JSON-RPC: notifications (no id) must not receive responses
+        guard id != nil else { return }
         let response: [String: Any] = [
             "jsonrpc": "2.0",
-            "id": id ?? NSNull(),
+            "id": id!,
             "error": ["code": code, "message": message]
         ]
         emit(response)
@@ -1393,5 +1429,9 @@ private class MCPServer {
 // MARK: - Entry Point
 
 private let server = MCPServer()
-DispatchQueue.global(qos: .userInitiated).async { server.run(); exit(0) }
+DispatchQueue.global(qos: .userInitiated).async {
+    server.run()
+    fflush(stdout)
+    exit(0)
+}
 RunLoop.main.run()
