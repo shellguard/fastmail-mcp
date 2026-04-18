@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (45 total)
+## Tools (49 total)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -109,6 +109,12 @@ All JMAP calls follow this pattern:
 ### Quota (1)
 - `fm_get_quota` — storage usage and limits
 
+### Agentic Workflow (4)
+- `fm_list_email_ids` — lightweight scan: IDs + from + subject + date only (up to 1000/call)
+- `fm_batch_get_emails` — fetch up to 50 emails by ID with bodies in one call
+- `fm_get_mailbox_stats` — sender/domain frequency, date range, size stats (scans up to 1000)
+- `fm_get_sieve_capabilities` — server's supported Sieve extensions and limits
+
 ### Sieve Filters (6)
 - `fm_list_sieve_scripts` — list all Sieve scripts with name and active status
 - `fm_get_sieve_script` — get script by ID with full source code
@@ -152,6 +158,9 @@ All JMAP calls follow this pattern:
 - Calendar tools use JSCalendar format (RFC 8984) for events
 - Contact tools accept both simple fields (`firstName`, `emails` as strings) and full JSContact format
 - Masked email uses Fastmail's proprietary extension (`MaskedEmail/get`, `MaskedEmail/set`)
+- `fm_get_mailbox_stats` paginates internally (up to 5 JMAP calls) to scan up to 1000 emails
+- `fm_list_email_ids` returns minimal fields for fast triage (up to 1000/call, vs 200 for full emails)
+- `fm_batch_get_emails` caps at 50 per call with 256KB body limit per email
 - Sieve tools use blob upload/download for script content (RFC 9661 pattern)
 - Sieve scripts support `vnd.cyrus.jmapquery` for JMAP filter syntax inside Sieve rules
 - Only one Sieve script can be active at a time; activation is atomic via `onSuccessActivateScript`

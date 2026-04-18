@@ -48,6 +48,7 @@ var (
 	cachedPrimaryAccounts  = map[string]string{} // capability → accountId
 	cachedFallbackAccount  string
 	cachedCapabilities     = map[string]bool{} // all capability URNs the server advertises
+	cachedCapabilityData   = map[string]m{}    // full capability objects (for reading sieveExtensions etc.)
 	httpClient             = &http.Client{Timeout: 90 * time.Second}
 )
 
@@ -112,10 +113,28 @@ func sessionFor(capabilities []string) (apiURL, accountID string, err error) {
 		if ul, _ := session["uploadUrl"].(string); ul != "" {
 			cachedUploadURL = ul
 		}
-		// Cache all capabilities the server advertises
+		// Cache all capabilities the server advertises (both keys and full objects)
 		if caps, _ := session["capabilities"].(map[string]any); caps != nil {
-			for cap := range caps {
+			for cap, val := range caps {
 				cachedCapabilities[cap] = true
+				if obj, ok := val.(map[string]any); ok {
+					cachedCapabilityData[cap] = obj
+				}
+			}
+		}
+		// Also cache account-level capabilities
+		if acctMap, _ := session["accounts"].(map[string]any); acctMap != nil {
+			for _, acctVal := range acctMap {
+				if acct, ok := acctVal.(map[string]any); ok {
+					if acctCaps, ok := acct["accountCapabilities"].(map[string]any); ok {
+						for cap, val := range acctCaps {
+							cachedCapabilities[cap] = true
+							if obj, ok := val.(map[string]any); ok {
+								cachedCapabilityData[cap] = obj
+							}
+						}
+					}
+				}
 			}
 		}
 		for cap, v := range primary {
@@ -1679,6 +1698,374 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ── Agentic Workflow Tools ───────────────────────────────────────────────────
+
+// fm_list_email_ids: lightweight scan — returns only IDs + from + subject + date
+// for fast mailbox traversal without body content.
+func listEmailIDs(params m) (any, error) {
+	mailboxID := getString(params, "mailboxId")
+	if mailboxID == "" {
+		return nil, errInvalidParams("mailboxId is required")
+	}
+	limit := intParam(params, "limit", 100, 1000) // higher cap for scanning
+	offset := intParam(params, "offset", 0, 0)
+	onlyUnread := getBool(params, "onlyUnread")
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	filter := m{"inMailbox": mailboxID}
+	if onlyUnread {
+		filter["notKeyword"] = "$seen"
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/query", m{
+			"accountId":       acct,
+			"filter":          filter,
+			"sort":            []m{{"property": "receivedAt", "isAscending": false}},
+			"position":        offset,
+			"limit":           limit,
+			"collapseThreads": false,
+			"calculateTotal":  true,
+		}, "q0"},
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+			"properties": []string{"id", "from", "subject", "receivedAt", "keywords", "size"},
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(responses) < 2 {
+		return nil, errToolError("Unexpected response")
+	}
+
+	emails, ok := respList(responses[1])
+	if !ok {
+		return nil, errToolError("Unexpected response")
+	}
+
+	out := make([]m, len(emails))
+	for i, e := range emails {
+		keywords := getMap(e, "keywords")
+		_, isRead := keywords["$seen"]
+		_, isFlagged := keywords["$flagged"]
+		from := ""
+		if addrs := getMapSlice(e, "from"); len(addrs) > 0 {
+			from = getString(addrs[0], "email")
+			if name := getString(addrs[0], "name"); name != "" {
+				from = name + " <" + from + ">"
+			}
+		}
+		out[i] = m{
+			"id":         getString(e, "id"),
+			"from":       from,
+			"subject":    getString(e, "subject"),
+			"receivedAt": getString(e, "receivedAt"),
+			"isRead":     isRead,
+			"isFlagged":  isFlagged,
+			"size":       getFloat(e, "size"),
+		}
+	}
+
+	result := m{"emails": out, "offset": offset, "limit": limit, "count": len(out)}
+	if qData, ok := respData(responses[0]); ok {
+		if total, ok := qData["total"].(float64); ok {
+			result["total"] = int(total)
+		}
+	}
+	return result, nil
+}
+
+// fm_batch_get_emails: fetch multiple emails by ID with bodies in one call.
+func batchGetEmails(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+	if len(ids) > 50 {
+		return nil, errInvalidParams("Maximum 50 emails per batch")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	props := []string{"id", "threadId", "mailboxIds", "from", "to", "cc",
+		"subject", "receivedAt", "preview", "keywords", "size",
+		"textBody", "bodyValues"}
+	fetchArgs := m{
+		"accountId":           acct,
+		"ids":                 ids,
+		"properties":          props,
+		"fetchTextBodyValues": true,
+		"maxBodyValueBytes":   256 * 1024, // 256KB per body
+	}
+
+	// Optionally include HTML bodies
+	if getBool(params, "includeHTML") {
+		fetchArgs["properties"] = append(props, "htmlBody")
+		fetchArgs["fetchHTMLBodyValues"] = true
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/get", fetchArgs, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Email/get response")
+	}
+
+	list := getMapSlice(data, "list")
+	notFound := getStringSlice(data, "notFound")
+
+	out := make([]m, len(list))
+	for i, e := range list {
+		d := emailSummaryDict(e)
+		d["body"] = extractBodyText(e)
+		if getBool(params, "includeHTML") {
+			d["htmlBody"] = extractHTMLBody(e)
+		}
+		out[i] = d
+	}
+
+	result := m{"emails": out, "count": len(out)}
+	if len(notFound) > 0 {
+		result["notFound"] = notFound
+	}
+	return result, nil
+}
+
+// fm_get_mailbox_stats: aggregate sender frequency, date distribution, and size stats.
+// Scans up to 1000 emails for a statistical overview.
+func getMailboxStats(params m) (any, error) {
+	mailboxID := getString(params, "mailboxId")
+	if mailboxID == "" {
+		return nil, errInvalidParams("mailboxId is required")
+	}
+	maxScan := intParam(params, "maxScan", 500, 1000)
+	onlyUnread := getBool(params, "onlyUnread")
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	filter := m{"inMailbox": mailboxID}
+	if onlyUnread {
+		filter["notKeyword"] = "$seen"
+	}
+
+	// Fetch in pages to build stats
+	senderCounts := map[string]int{}   // email → count
+	senderNames := map[string]string{} // email → display name
+	domainCounts := map[string]int{}   // domain → count
+	var totalSize float64
+	var totalEmails int
+	var oldest, newest string
+
+	scanned := 0
+	for scanned < maxScan {
+		batchSize := maxScan - scanned
+		if batchSize > 200 {
+			batchSize = 200
+		}
+
+		responses, err := jmapCall([]any{
+			[]any{"Email/query", m{
+				"accountId":       acct,
+				"filter":          filter,
+				"sort":            []m{{"property": "receivedAt", "isAscending": false}},
+				"position":        scanned,
+				"limit":           batchSize,
+				"collapseThreads": false,
+				"calculateTotal":  scanned == 0, // only on first page
+			}, "q0"},
+			[]any{"Email/get", m{
+				"accountId": acct,
+				"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+				"properties": []string{"id", "from", "receivedAt", "size"},
+			}, "g0"},
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(responses) < 2 {
+			break
+		}
+
+		// Get total on first page
+		if scanned == 0 {
+			if qData, ok := respData(responses[0]); ok {
+				if t, ok := qData["total"].(float64); ok {
+					totalEmails = int(t)
+				}
+			}
+		}
+
+		emails, ok := respList(responses[1])
+		if !ok || len(emails) == 0 {
+			break
+		}
+
+		for _, e := range emails {
+			// Sender aggregation
+			if addrs := getMapSlice(e, "from"); len(addrs) > 0 {
+				email := strings.ToLower(getString(addrs[0], "email"))
+				name := getString(addrs[0], "name")
+				if email != "" {
+					senderCounts[email]++
+					if name != "" {
+						senderNames[email] = name
+					}
+					parts := strings.SplitN(email, "@", 2)
+					if len(parts) == 2 {
+						domainCounts[parts[1]]++
+					}
+				}
+			}
+
+			// Date tracking
+			date := getString(e, "receivedAt")
+			if date != "" {
+				if newest == "" || date > newest {
+					newest = date
+				}
+				if oldest == "" || date < oldest {
+					oldest = date
+				}
+			}
+
+			totalSize += getFloat(e, "size")
+		}
+
+		scanned += len(emails)
+		if len(emails) < batchSize {
+			break // no more results
+		}
+	}
+
+	// Sort senders by frequency (top 50)
+	type senderEntry struct {
+		Email string
+		Name  string
+		Count int
+	}
+	senders := make([]senderEntry, 0, len(senderCounts))
+	for email, count := range senderCounts {
+		senders = append(senders, senderEntry{email, senderNames[email], count})
+	}
+	// Simple insertion sort for top-N (good enough for ≤1000 unique senders)
+	for i := 1; i < len(senders); i++ {
+		for j := i; j > 0 && senders[j].Count > senders[j-1].Count; j-- {
+			senders[j], senders[j-1] = senders[j-1], senders[j]
+		}
+	}
+	topSenders := make([]m, 0, 50)
+	for i, s := range senders {
+		if i >= 50 {
+			break
+		}
+		entry := m{"email": s.Email, "count": s.Count}
+		if s.Name != "" {
+			entry["name"] = s.Name
+		}
+		topSenders = append(topSenders, entry)
+	}
+
+	// Sort domains by frequency (top 30)
+	type domainEntry struct {
+		Domain string
+		Count  int
+	}
+	domains := make([]domainEntry, 0, len(domainCounts))
+	for domain, count := range domainCounts {
+		domains = append(domains, domainEntry{domain, count})
+	}
+	for i := 1; i < len(domains); i++ {
+		for j := i; j > 0 && domains[j].Count > domains[j-1].Count; j-- {
+			domains[j], domains[j-1] = domains[j-1], domains[j]
+		}
+	}
+	topDomains := make([]m, 0, 30)
+	for i, d := range domains {
+		if i >= 30 {
+			break
+		}
+		topDomains = append(topDomains, m{"domain": d.Domain, "count": d.Count})
+	}
+
+	return m{
+		"mailboxId":     mailboxID,
+		"totalEmails":   totalEmails,
+		"scanned":       scanned,
+		"uniqueSenders": len(senderCounts),
+		"uniqueDomains": len(domainCounts),
+		"topSenders":    topSenders,
+		"topDomains":    topDomains,
+		"totalSizeBytes": int(totalSize),
+		"oldestEmail":   oldest,
+		"newestEmail":   newest,
+	}, nil
+}
+
+// fm_get_sieve_capabilities: return the server's supported Sieve extensions.
+func getSieveCapabilities(_ m) (any, error) {
+	// Ensure session is loaded
+	_, _, err := sessionFor(defaultCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionMu.Lock()
+	hasSieve := cachedCapabilities["urn:ietf:params:jmap:sieve"]
+	sieveData := cachedCapabilityData["urn:ietf:params:jmap:sieve"]
+	sessionMu.Unlock()
+
+	if !hasSieve {
+		return m{
+			"supported":  false,
+			"message":    "urn:ietf:params:jmap:sieve capability not advertised by server",
+		}, nil
+	}
+
+	result := m{"supported": true}
+
+	if sieveData != nil {
+		if exts := getStringSlice(sieveData, "sieveExtensions"); len(exts) > 0 {
+			result["extensions"] = exts
+		}
+		if impl := getString(sieveData, "implementation"); impl != "" {
+			result["implementation"] = impl
+		}
+		if maxSize, ok := sieveData["maxSizeScript"].(float64); ok {
+			result["maxSizeScript"] = int(maxSize)
+		}
+		if maxScripts, ok := sieveData["maxNumberScripts"].(float64); ok {
+			result["maxNumberScripts"] = int(maxScripts)
+		}
+		if maxName, ok := sieveData["maxSizeScriptName"].(float64); ok {
+			result["maxSizeScriptName"] = int(maxName)
+		}
+		if notif := getStringSlice(sieveData, "notificationMethods"); len(notif) > 0 {
+			result["notificationMethods"] = notif
+		}
+	}
+
+	return result, nil
 }
 
 // ── Thread Tools ────────────────────────────────────────────────────────────
@@ -3919,6 +4306,52 @@ var tools = []toolDefinition{
 		},
 	},
 
+	// Agentic Workflow
+	{
+		Name:        "fm_list_email_ids",
+		Description: "Lightweight mailbox scan — returns only IDs, sender, subject, date, read/flag status. Up to 1000 per call. Use for fast triage before batch operations.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"mailboxId":  m{"type": "string", "description": "Mailbox ID to scan"},
+				"limit":      m{"type": "integer", "description": "Max emails (default 100, max 1000)"},
+				"offset":     m{"type": "integer", "description": "Offset for pagination"},
+				"onlyUnread": m{"type": "boolean", "description": "Only unread emails (default false)"},
+			},
+			"required": []string{"mailboxId"},
+		},
+	},
+	{
+		Name:        "fm_batch_get_emails",
+		Description: "Fetch multiple emails by ID with text bodies in one call. Max 50 per batch.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids":         m{"type": "array", "description": "Email IDs to fetch (max 50)", "items": m{"type": "string"}},
+				"includeHTML": m{"type": "boolean", "description": "Also include HTML bodies (default false)"},
+			},
+			"required": []string{"ids"},
+		},
+	},
+	{
+		Name:        "fm_get_mailbox_stats",
+		Description: "Aggregate statistics for a mailbox: top senders, top domains, date range, size. Scans up to 1000 emails for a statistical overview — ideal for planning cleanup and Sieve rules.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"mailboxId":  m{"type": "string", "description": "Mailbox ID to analyze"},
+				"maxScan":    m{"type": "integer", "description": "Max emails to scan (default 500, max 1000)"},
+				"onlyUnread": m{"type": "boolean", "description": "Only analyze unread emails (default false)"},
+			},
+			"required": []string{"mailboxId"},
+		},
+	},
+	{
+		Name:        "fm_get_sieve_capabilities",
+		Description: "Get the server's supported Sieve extensions and limits. Use before writing Sieve scripts to know which features are available (e.g. vnd.cyrus.jmapquery, regex, editheader).",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+
 	// Sieve Filter Management
 	{
 		Name:        "fm_list_sieve_scripts",
@@ -4041,6 +4474,11 @@ var toolHandlers = map[string]toolFunc{
 	"fm_download_attachment":  downloadAttachment,
 	// Import
 	"fm_import_email":         importEmail,
+	// Agentic Workflow
+	"fm_list_email_ids":        listEmailIDs,
+	"fm_batch_get_emails":      batchGetEmails,
+	"fm_get_mailbox_stats":     getMailboxStats,
+	"fm_get_sieve_capabilities": getSieveCapabilities,
 	// Sieve
 	"fm_list_sieve_scripts":   listSieveScripts,
 	"fm_get_sieve_script":     getSieveScript,
@@ -4108,7 +4546,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.1.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.2.0"},
 		})
 
 	case "notifications/initialized":
