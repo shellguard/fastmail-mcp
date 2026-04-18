@@ -151,6 +151,10 @@ All JMAP calls follow this pattern:
 | Masked Email | `https://www.fastmail.com/dev/maskedemail` |
 | Sieve | `urn:ietf:params:jmap:sieve` (RFC 9661) |
 
+## AI Playbooks
+
+See **SKILLS.md** for agentic workflow playbooks — step-by-step patterns for inbox cleanup, spam management, duplicate removal, Sieve authoring, calendar management, and more. That file is the AI-facing "how to use these tools together" guide.
+
 ## Adding a New Tool
 
 1. Add a Go function with signature `func myTool(params m) (any, error)` in the tool implementations section
