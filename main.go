@@ -2068,6 +2068,167 @@ func getSieveCapabilities(_ m) (any, error) {
 	return result, nil
 }
 
+// fm_find_duplicates: scan a mailbox for duplicate emails by Message-ID or
+// composite key (subject + from + receivedAt) and return grouped duplicates.
+func findDuplicates(params m) (any, error) {
+	mailboxID := getString(params, "mailboxId")
+	if mailboxID == "" {
+		return nil, errInvalidParams("mailboxId is required")
+	}
+	maxScan := intParam(params, "maxScan", 1000, 5000)
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	filter := m{"inMailbox": mailboxID}
+
+	// Track duplicates by key → list of email entries
+	type emailEntry struct {
+		ID         string
+		Subject    string
+		From       string
+		ReceivedAt string
+		Size       float64
+	}
+	groups := map[string][]emailEntry{} // dedup key → entries
+
+	scanned := 0
+	for scanned < maxScan {
+		batchSize := maxScan - scanned
+		if batchSize > 200 {
+			batchSize = 200
+		}
+
+		responses, err := jmapCall([]any{
+			[]any{"Email/query", m{
+				"accountId":       acct,
+				"filter":          filter,
+				"sort":            []m{{"property": "receivedAt", "isAscending": true}},
+				"position":        scanned,
+				"limit":           batchSize,
+				"collapseThreads": false,
+			}, "q0"},
+			[]any{"Email/get", m{
+				"accountId": acct,
+				"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+				"properties": []string{"id", "messageId", "from", "subject", "receivedAt", "size"},
+			}, "g0"},
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(responses) < 2 {
+			break
+		}
+
+		emails, ok := respList(responses[1])
+		if !ok || len(emails) == 0 {
+			break
+		}
+
+		for _, e := range emails {
+			from := ""
+			if addrs := getMapSlice(e, "from"); len(addrs) > 0 {
+				from = strings.ToLower(getString(addrs[0], "email"))
+			}
+
+			entry := emailEntry{
+				ID:         getString(e, "id"),
+				Subject:    getString(e, "subject"),
+				From:       from,
+				ReceivedAt: getString(e, "receivedAt"),
+				Size:       getFloat(e, "size"),
+			}
+
+			// Primary key: Message-ID header (most reliable)
+			var key string
+			if msgIDs := getStringSlice(e, "messageId"); len(msgIDs) > 0 && msgIDs[0] != "" {
+				key = "msgid:" + msgIDs[0]
+			} else {
+				// Fallback: composite of subject + from + date (truncated to minute)
+				date := entry.ReceivedAt
+				if len(date) > 16 {
+					date = date[:16] // "2026-04-18T14:30" — truncate seconds
+				}
+				key = "composite:" + from + "|" + entry.Subject + "|" + date
+			}
+
+			groups[key] = append(groups[key], entry)
+		}
+
+		scanned += len(emails)
+		if len(emails) < batchSize {
+			break
+		}
+	}
+
+	// Filter to only groups with duplicates (2+ entries)
+	type dupGroup struct {
+		Key     string
+		Entries []emailEntry
+	}
+	var duplicates []dupGroup
+	totalDuplicateEmails := 0
+	for key, entries := range groups {
+		if len(entries) > 1 {
+			duplicates = append(duplicates, dupGroup{Key: key, Entries: entries})
+			totalDuplicateEmails += len(entries) - 1 // all but one are dupes
+		}
+	}
+
+	// Sort by group size descending (biggest duplicate clusters first)
+	for i := 1; i < len(duplicates); i++ {
+		for j := i; j > 0 && len(duplicates[j].Entries) > len(duplicates[j-1].Entries); j-- {
+			duplicates[j], duplicates[j-1] = duplicates[j-1], duplicates[j]
+		}
+	}
+
+	// Cap output to 100 groups
+	if len(duplicates) > 100 {
+		duplicates = duplicates[:100]
+	}
+
+	// Format output
+	outGroups := make([]m, len(duplicates))
+	for i, dg := range duplicates {
+		entries := make([]m, len(dg.Entries))
+		for j, e := range dg.Entries {
+			entries[j] = m{
+				"id":         e.ID,
+				"from":       e.From,
+				"subject":    e.Subject,
+				"receivedAt": e.ReceivedAt,
+				"size":       e.Size,
+			}
+		}
+		// Suggest keeping the first (oldest) and deleting the rest
+		keepID := dg.Entries[0].ID
+		deleteIDs := make([]string, 0, len(dg.Entries)-1)
+		for _, e := range dg.Entries[1:] {
+			deleteIDs = append(deleteIDs, e.ID)
+		}
+		outGroups[i] = m{
+			"count":           len(dg.Entries),
+			"subject":         dg.Entries[0].Subject,
+			"from":            dg.Entries[0].From,
+			"emails":          entries,
+			"suggestKeep":     keepID,
+			"suggestDeleteIds": deleteIDs,
+		}
+	}
+
+	return m{
+		"mailboxId":          mailboxID,
+		"scanned":            scanned,
+		"duplicateGroups":    len(duplicates),
+		"duplicateEmails":    totalDuplicateEmails,
+		"groups":             outGroups,
+	}, nil
+}
+
 // ── Thread Tools ────────────────────────────────────────────────────────────
 
 func getThread(params m) (any, error) {
@@ -4351,6 +4512,18 @@ var tools = []toolDefinition{
 		Description: "Get the server's supported Sieve extensions and limits. Use before writing Sieve scripts to know which features are available (e.g. vnd.cyrus.jmapquery, regex, editheader).",
 		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
 	},
+	{
+		Name:        "fm_find_duplicates",
+		Description: "Scan a mailbox for duplicate emails. Groups by Message-ID header (or subject+from+date fallback). Returns duplicate groups with suggested IDs to keep/delete. Use with fm_delete_email to remove duplicates.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"mailboxId": m{"type": "string", "description": "Mailbox ID to scan for duplicates"},
+				"maxScan":   m{"type": "integer", "description": "Max emails to scan (default 1000, max 5000)"},
+			},
+			"required": []string{"mailboxId"},
+		},
+	},
 
 	// Sieve Filter Management
 	{
@@ -4479,6 +4652,7 @@ var toolHandlers = map[string]toolFunc{
 	"fm_batch_get_emails":      batchGetEmails,
 	"fm_get_mailbox_stats":     getMailboxStats,
 	"fm_get_sieve_capabilities": getSieveCapabilities,
+	"fm_find_duplicates":        findDuplicates,
 	// Sieve
 	"fm_list_sieve_scripts":   listSieveScripts,
 	"fm_get_sieve_script":     getSieveScript,

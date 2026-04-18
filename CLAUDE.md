@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (49 total)
+## Tools (50 total)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -109,11 +109,12 @@ All JMAP calls follow this pattern:
 ### Quota (1)
 - `fm_get_quota` — storage usage and limits
 
-### Agentic Workflow (4)
+### Agentic Workflow (5)
 - `fm_list_email_ids` — lightweight scan: IDs + from + subject + date only (up to 1000/call)
 - `fm_batch_get_emails` — fetch up to 50 emails by ID with bodies in one call
 - `fm_get_mailbox_stats` — sender/domain frequency, date range, size stats (scans up to 1000)
 - `fm_get_sieve_capabilities` — server's supported Sieve extensions and limits
+- `fm_find_duplicates` — scan mailbox for duplicate emails by Message-ID (or subject+from+date fallback), returns groups with suggested keep/delete IDs
 
 ### Sieve Filters (6)
 - `fm_list_sieve_scripts` — list all Sieve scripts with name and active status
