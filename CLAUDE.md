@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A single-file Go MCP server (`main.go`) that exposes Fastmail email, contacts, and identities as MCP tools via the JMAP API. No external dependencies — stdlib only.
+A single-file Go MCP server (`main.go`) that exposes Fastmail email, contacts, calendars, masked email, and more as MCP tools via the JMAP API. No external dependencies — stdlib only.
 
 Cross-platform: builds for macOS, Windows, and Linux from a single codebase.
 
@@ -18,7 +18,7 @@ GOOS=windows GOARCH=amd64 go build -o fastmail-mcp.exe .  # Cross-compile for Wi
 
 Set `FASTMAIL_TOKEN` environment variable with a Fastmail API token.
 Generate one at: Fastmail → Settings → Privacy & Security → API tokens → New API token.
-Required scopes: Mail, Contacts, Submission.
+Required scopes: **Mail, Contacts, Calendars, Submission**.
 
 ## Architecture
 
@@ -27,71 +27,103 @@ Single-file Go (`main.go`), no external dependencies. Uses `net/http` for synchr
 **Logical sections (in order):**
 1. MCP protocol types (`toolDefinition`, `mcpError`)
 2. JMAP session discovery + HTTP helpers (`sessionFor`, `jmapCall`, `doHTTPWithRetry`)
-3. JSON helpers (`getString`, `getMap`, `respData`, `respList`, etc.)
-4. Tool implementations (one Go function per tool)
-5. Serialization helpers (`emailSummaryDict`, `contactSummaryDict`, etc.)
-6. Utility functions (`intParam`, `contains`, `parseBridgeSubject`)
-7. Tool definitions (`tools` slice)
-8. Tool dispatch (`callTool` via `toolHandlers` map)
-9. MCP server (`run`, `handleMessage` — JSON-RPC stdio loop)
-10. Entry point (`main`)
+3. Capability helpers (mail, contacts, calendar, masked email, vacation, quota)
+4. JSON helpers (`getString`, `getMap`, `respData`, `respList`, etc.)
+5. Tool implementations — one Go function per tool, grouped by domain
+6. Serialization helpers (`emailSummaryDict`, `eventSummaryDict`, etc.)
+7. Utility functions (`intParam`, `contains`, `parseBridgeSubject`)
+8. Tool definitions (`tools` slice — 39 total)
+9. Tool dispatch (`callTool` via `toolHandlers` map)
+10. MCP server (`run`, `handleMessage` — JSON-RPC stdio loop)
+11. Entry point (`main`)
 
 ## JMAP API Pattern
 
 All JMAP calls follow this pattern:
-1. Session discovery: `GET https://api.fastmail.com/jmap/session` (cached)
+1. Session discovery: `GET https://api.fastmail.com/jmap/session` (cached, includes downloadUrl/uploadUrl)
 2. Method calls: `POST` to `session.apiUrl` with `{"using": [...], "methodCalls": [...]}`
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (14 total)
+## Tools (39 total)
 
-### Email (8)
+### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
 - `fm_list_emails` — emails in mailbox; params: mailboxId, limit, offset, onlyUnread
-- `fm_get_email` — full email by ID with body, HTML, attachments
-- `fm_search_emails` — search with text or JMAP filter JSON; params: query, mailboxId, limit
+- `fm_get_email` — full email with body, HTML, attachment details (blobId for download)
+- `fm_search_emails` — search with text or JMAP filter; params: query, mailboxId, limit, includeSnippets
 - `fm_send_email` — send email; params: to, subject, body, cc, replyToId
 - `fm_mark_read` — mark read/unread; params: ids, read
 - `fm_move_email` — move to mailbox; params: ids, mailboxId
 - `fm_delete_email` — move to Trash; params: ids
+- `fm_import_email` — import RFC 5322 message from blob; params: blobId, mailboxId
+
+### Thread (1)
+- `fm_get_thread` — full conversation thread from any email ID
+
+### Mailbox Management (3)
+- `fm_create_mailbox` — create folder; params: name, parentId
+- `fm_rename_mailbox` — rename or move folder; params: id, name, parentId
+- `fm_delete_mailbox` — delete folder; params: id, deleteContents
 
 ### Bridge Inbox (2)
 - `fm_list_bridge_messages` — unread emails in Bridge mailbox with parsed structured types
 - `fm_ack_bridge_message` — mark read + move to Bridge/Processed
 
-### Contacts (2)
+### Calendar (7)
+- `fm_list_calendars` — all calendars with name, color, visibility
+- `fm_list_events` — events in date range; params: after, before, calendarId, limit
+- `fm_get_event` — full event detail (participants, recurrence, alerts, locations)
+- `fm_create_event` — create event; params: calendarId, title, start, timeZone, duration, etc.
+- `fm_update_event` — update event fields; params: id + any fields
+- `fm_delete_event` — delete event; params: id
+- `fm_rsvp_event` — respond to invitation; params: id, status, email
+
+### Contacts (5)
 - `fm_list_contacts` — list/search contacts; params: limit, search
 - `fm_get_contact` — contact by ID with full details
+- `fm_create_contact` — create contact; params: firstName, lastName, emails, phones, company, notes
+- `fm_update_contact` — update contact fields; params: id + any fields
+- `fm_delete_contact` — delete contact; params: id
 
-### Identity (1)
+### Address Books (1)
+- `fm_list_address_books` — list contact address books
+
+### Identity (2)
 - `fm_list_identities` — sending identities (email addresses)
+- `fm_update_identity` — update identity; params: id, name, textSignature, htmlSignature, replyTo, bcc
 
-## Bridge Message Convention
+### Masked Email (3)
+- `fm_list_masked_emails` — list all masked email aliases; params: state (filter)
+- `fm_create_masked_email` — create alias; params: forDomain, description
+- `fm_update_masked_email` — enable/disable/update alias; params: id, state, description
 
-The bridge inbox is a designated Fastmail mailbox (default name: "Bridge") for structured messages that Claude can process as actionable items.
+### Vacation Response (2)
+- `fm_get_vacation_response` — current auto-responder settings
+- `fm_set_vacation_response` — configure auto-responder; params: isEnabled, subject, textBody, fromDate, toDate
 
-### Subject format
-```
-[TYPE] description
-```
+### Snooze & Flags (2)
+- `fm_snooze_email` — snooze email; params: id, until, mailboxId
+- `fm_flag_email` — set/remove keywords; params: ids, keyword, set
 
-Supported types:
-- `[TASK]` — actionable task, e.g. `[TASK] Buy groceries`
-- `[EVENT]` — calendar event, e.g. `[EVENT] Doctor appointment 2026-03-15 14:00`
-- `[NOTE]` — note/reminder, e.g. `[NOTE] Remember to call Mom`
+### Quota (1)
+- `fm_get_quota` — storage usage and limits
 
-### Setup
-1. Create a mailbox called "Bridge" in Fastmail
-2. Create a subfolder "Processed" under Bridge (Bridge/Processed)
-3. Send structured emails to yourself with `[TYPE] description` subjects
-4. Use `fm_list_bridge_messages` to read and `fm_ack_bridge_message` to process
+### Attachment (1)
+- `fm_download_attachment` — get download URL for attachment; params: blobId, name, type
 
-### How it works
-- `fm_list_bridge_messages` reads unread emails from the Bridge mailbox
-- If the subject matches `[TYPE] description`, returns `bridgeType` and `bridgeDescription` fields
-- Body is free text — returned as-is for the caller to interpret
-- `fm_ack_bridge_message` marks the message read and moves to Bridge/Processed
+## JMAP Capabilities Used
+
+| Domain | Capability URN |
+|--------|---------------|
+| Core | `urn:ietf:params:jmap:core` |
+| Mail | `urn:ietf:params:jmap:mail` |
+| Submission | `urn:ietf:params:jmap:submission` |
+| Vacation | `urn:ietf:params:jmap:vacationresponse` |
+| Quota | `urn:ietf:params:jmap:quota` |
+| Contacts | `https://www.fastmail.com/dev/contacts` |
+| Calendars | `https://www.fastmail.com/dev/calendars` |
+| Masked Email | `https://www.fastmail.com/dev/maskedemail` |
 
 ## Adding a New Tool
 
@@ -103,12 +135,15 @@ Supported types:
 ## Key Design Notes
 
 - Session is cached for process lifetime (no re-discovery per call), protected by `sync.Mutex`
+- Session also caches `downloadUrl` and `uploadUrl` templates for blob operations
 - 429 rate limit: retries up to 2 times with `Retry-After` delay (capped at 30s)
-- `fm_send_email` accepts both `[{name, email}]` objects and plain `["email"]` string arrays for to/cc
-- `fm_send_email` moves sent mail to the Sent folder (falls back to destroying draft if no Sent folder)
-- `fm_search_emails` query can be plain text (becomes `{"text": query}`) or a JSON JMAP filter string
-- Contacts use `https://www.fastmail.com/dev/contacts` capability and `ContactCard/query+get`
-- Sending uses `urn:ietf:params:jmap:submission` capability with `Email/set` + `EmailSubmission/set`
+- `fm_send_email` moves sent mail to the Sent folder via `onSuccessUpdateEmail`
+- `fm_search_emails` supports `includeSnippets` for highlighted search results via `SearchSnippet/get`
+- `fm_get_email` returns attachment details with `blobId` for use with `fm_download_attachment`
+- Calendar tools use JSCalendar format (RFC 8984) for events
+- Contact tools accept both simple fields (`firstName`, `emails` as strings) and full JSContact format
+- Masked email uses Fastmail's proprietary extension (`MaskedEmail/get`, `MaskedEmail/set`)
+- Snooze uses Fastmail's proprietary `snoozed` property on Email
 - Limit params are capped at 200 to prevent oversized JMAP responses
 - JSON-RPC notifications (no `id`) never receive responses
 - Proper JSON-RPC error codes: -32600 (invalid request), -32601 (method not found), -32602 (invalid params)

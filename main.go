@@ -42,8 +42,11 @@ func errAuthError(msg string) *mcpError       { return &mcpError{msg, -32000} }
 var (
 	sessionMu              sync.Mutex
 	cachedSessionAPIURL    string
+	cachedDownloadURL      string // template with {accountId}, {blobId}, {name}, {type}
+	cachedUploadURL        string // template with {accountId}
 	cachedPrimaryAccounts  = map[string]string{} // capability → accountId
 	cachedFallbackAccount  string
+	cachedCapabilities     = map[string]bool{} // all capability URNs the server advertises
 	httpClient             = &http.Client{Timeout: 90 * time.Second}
 )
 
@@ -98,6 +101,18 @@ func sessionFor(capabilities []string) (apiURL, accountID string, err error) {
 		}
 
 		cachedSessionAPIURL = url
+		if dl, _ := session["downloadUrl"].(string); dl != "" {
+			cachedDownloadURL = dl
+		}
+		if ul, _ := session["uploadUrl"].(string); ul != "" {
+			cachedUploadURL = ul
+		}
+		// Cache all capabilities the server advertises
+		if caps, _ := session["capabilities"].(map[string]any); caps != nil {
+			for cap := range caps {
+				cachedCapabilities[cap] = true
+			}
+		}
 		for cap, v := range primary {
 			if id, ok := v.(string); ok {
 				cachedPrimaryAccounts[cap] = id
@@ -251,6 +266,61 @@ func contactsAccountID() (string, error) {
 		"https://www.fastmail.com/dev/contacts",
 	})
 	return id, err
+}
+
+var calendarCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:calendars",
+	"https://www.fastmail.com/dev/calendars",
+}
+
+func calendarAccountID() (string, error) {
+	_, id, err := sessionFor(calendarCaps)
+	return id, err
+}
+
+var maskedEmailCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"https://www.fastmail.com/dev/maskedemail",
+}
+
+func maskedEmailAccountID() (string, error) {
+	_, id, err := sessionFor(maskedEmailCaps)
+	return id, err
+}
+
+var vacationCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:mail",
+	"urn:ietf:params:jmap:vacationresponse",
+}
+
+var quotaCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:quota",
+}
+
+var submissionCapsGlobal = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:mail",
+	"urn:ietf:params:jmap:submission",
+}
+
+// blobDownloadURL builds the download URL for a blob.
+func blobDownloadURL(accountID, blobID, name, mimeType string) string {
+	sessionMu.Lock()
+	tpl := cachedDownloadURL
+	sessionMu.Unlock()
+	if tpl == "" {
+		return ""
+	}
+	r := strings.NewReplacer(
+		"{accountId}", accountID,
+		"{blobId}", blobID,
+		"{name}", name,
+		"{type}", mimeType,
+	)
+	return r.Replace(tpl)
 }
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
@@ -492,6 +562,7 @@ func searchEmails(params m) (any, error) {
 	}
 	limit := intParam(params, "limit", 20, 200)
 	mailboxID := getString(params, "mailboxId")
+	includeSnippets := getBool(params, "includeSnippets")
 
 	acct, err := mailAccountID()
 	if err != nil {
@@ -508,13 +579,13 @@ func searchEmails(params m) (any, error) {
 		filter["inMailbox"] = mailboxID
 	}
 
-	responses, err := jmapCall([]any{
+	calls := []any{
 		[]any{"Email/query", m{
-			"accountId":      acct,
-			"filter":         filter,
-			"sort":           []m{{"property": "receivedAt", "isAscending": false}},
-			"position":       0,
-			"limit":          limit,
+			"accountId":       acct,
+			"filter":          filter,
+			"sort":            []m{{"property": "receivedAt", "isAscending": false}},
+			"position":        0,
+			"limit":           limit,
 			"collapseThreads": false,
 		}, "q0"},
 		[]any{"Email/get", m{
@@ -523,7 +594,17 @@ func searchEmails(params m) (any, error) {
 			"properties": []string{"id", "threadId", "mailboxIds", "from", "to", "subject",
 				"receivedAt", "preview", "keywords", "size"},
 		}, "g0"},
-	}, nil)
+	}
+
+	if includeSnippets {
+		calls = append(calls, []any{"SearchSnippet/get", m{
+			"accountId":  acct,
+			"filter":     filter,
+			"#emailIds":  m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+		}, "s0"})
+	}
+
+	responses, err := jmapCall(calls, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -537,9 +618,30 @@ func searchEmails(params m) (any, error) {
 		return nil, errToolError("Unexpected search response")
 	}
 
+	// Build snippet map if available
+	snippetMap := map[string]m{}
+	if includeSnippets && len(responses) > 2 {
+		if snippetList, ok := respList(responses[2]); ok {
+			for _, s := range snippetList {
+				if eid := getString(s, "emailId"); eid != "" {
+					snippetMap[eid] = s
+				}
+			}
+		}
+	}
+
 	mapped := make([]m, len(emails))
 	for i, e := range emails {
-		mapped[i] = emailSummaryDict(e)
+		d := emailSummaryDict(e)
+		if snip, ok := snippetMap[getString(e, "id")]; ok {
+			if subj := getString(snip, "subject"); subj != "" {
+				d["snippetSubject"] = subj
+			}
+			if prev := getString(snip, "preview"); prev != "" {
+				d["snippetPreview"] = prev
+			}
+		}
+		mapped[i] = d
 	}
 
 	result := m{"emails": mapped, "limit": limit}
@@ -1283,15 +1385,19 @@ func emailDetailDict(email m) m {
 	d["htmlBody"] = extractHTMLBody(email)
 
 	if attachments := getMapSlice(email, "attachments"); len(attachments) > 0 {
-		names := []string{}
+		attList := []m{}
 		for _, att := range attachments {
-			if n := getString(att, "name"); n != "" {
-				names = append(names, n)
+			a := m{
+				"name": getString(att, "name"),
+				"type": getString(att, "type"),
+				"size": getFloat(att, "size"),
 			}
+			if bid := getString(att, "blobId"); bid != "" {
+				a["blobId"] = bid
+			}
+			attList = append(attList, a)
 		}
-		if len(names) > 0 {
-			d["attachmentNames"] = names
-		}
+		d["attachments"] = attList
 	}
 
 	return d
@@ -1455,6 +1561,1417 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
+// ── Thread Tools ────────────────────────────────────────────────────────────
+
+func getThread(params m) (any, error) {
+	emailID := getString(params, "id")
+	if emailID == "" {
+		return nil, errInvalidParams("id (email ID) is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the email to find its threadId
+	responses, err := jmapCall([]any{
+		[]any{"Email/get", m{
+			"accountId":  acct,
+			"ids":        []string{emailID},
+			"properties": []string{"threadId"},
+		}, "e0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	emailList := getMapSlice(must(respData(responses[0])), "list")
+	if len(emailList) == 0 {
+		return nil, errInvalidParams("Email not found: " + emailID)
+	}
+	threadID := getString(emailList[0], "threadId")
+	if threadID == "" {
+		return nil, errToolError("No threadId on email")
+	}
+
+	// Get the thread to find all email IDs
+	threadResponses, err := jmapCall([]any{
+		[]any{"Thread/get", m{
+			"accountId": acct,
+			"ids":       []string{threadID},
+		}, "t0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	threadList, ok := respList(threadResponses[0])
+	if !ok || len(threadList) == 0 {
+		return nil, errToolError("Thread not found: " + threadID)
+	}
+	threadEmailIDs := getStringSlice(threadList[0], "emailIds")
+	if len(threadEmailIDs) == 0 {
+		return nil, errToolError("Thread has no emails")
+	}
+
+	// Fetch all emails in thread
+	emailResponses, err := jmapCall([]any{
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"ids":       threadEmailIDs,
+			"properties": []string{"id", "threadId", "mailboxIds", "from", "to", "cc",
+				"subject", "receivedAt", "preview", "keywords", "size",
+				"textBody", "bodyValues"},
+			"fetchTextBodyValues": true,
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	emails, ok := respList(emailResponses[0])
+	if !ok {
+		return nil, errToolError("Failed to fetch thread emails")
+	}
+
+	out := make([]m, len(emails))
+	for i, e := range emails {
+		d := emailSummaryDict(e)
+		d["body"] = extractBodyText(e)
+		out[i] = d
+	}
+	return m{"threadId": threadID, "emails": out}, nil
+}
+
+// ── Mailbox Management Tools ────────────────────────────────────────────────
+
+func createMailbox(params m) (any, error) {
+	name := getString(params, "name")
+	if name == "" {
+		return nil, errInvalidParams("name is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	createObj := m{"name": name}
+	if parentID := getString(params, "parentId"); parentID != "" {
+		createObj["parentId"] = parentID
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Mailbox/set", m{
+			"accountId": acct,
+			"create":    m{"mb0": createObj},
+		}, "c0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Mailbox/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["mb0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create mailbox: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	if created, ok := data["created"].(map[string]any); ok {
+		if mb, ok := created["mb0"].(map[string]any); ok {
+			return m{"status": "created", "id": getString(mb, "id"), "name": name}, nil
+		}
+	}
+	return m{"status": "created", "name": name}, nil
+}
+
+func renameMailbox(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	if name := getString(params, "name"); name != "" {
+		update["name"] = name
+	}
+	if params["parentId"] != nil {
+		update["parentId"] = params["parentId"] // can be null to move to top level
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one of name or parentId is required")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Mailbox/set", m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Mailbox/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update mailbox: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": id}, nil
+}
+
+func deleteMailbox(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	setArgs := m{
+		"accountId": acct,
+		"destroy":   []string{id},
+	}
+	if getBool(params, "deleteContents") {
+		setArgs["onDestroyRemoveEmails"] = true
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Mailbox/set", setArgs, "d0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Mailbox/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete mailbox: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": id}, nil
+}
+
+// ── Vacation Response Tools ─────────────────────────────────────────────────
+
+func getVacationResponse(_ m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"VacationResponse/get", m{
+			"accountId": acct,
+			"ids":       []string{"singleton"},
+		}, "v0"},
+	}, vacationCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok || len(list) == 0 {
+		return nil, errToolError("Unexpected VacationResponse/get response")
+	}
+	vr := list[0]
+	return m{
+		"isEnabled": getBool(vr, "isEnabled"),
+		"fromDate":  vr["fromDate"],
+		"toDate":    vr["toDate"],
+		"subject":   getString(vr, "subject"),
+		"textBody":  getString(vr, "textBody"),
+		"htmlBody":  getString(vr, "htmlBody"),
+	}, nil
+}
+
+func setVacationResponse(params m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	if v, ok := params["isEnabled"]; ok {
+		update["isEnabled"] = v
+	}
+	if v, ok := params["subject"]; ok {
+		update["subject"] = v
+	}
+	if v, ok := params["textBody"]; ok {
+		update["textBody"] = v
+	}
+	if v, ok := params["htmlBody"]; ok {
+		update["htmlBody"] = v
+	}
+	if v, ok := params["fromDate"]; ok {
+		update["fromDate"] = v
+	}
+	if v, ok := params["toDate"]; ok {
+		update["toDate"] = v
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"VacationResponse/set", m{
+			"accountId": acct,
+			"update":    m{"singleton": update},
+		}, "v0"},
+	}, vacationCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected VacationResponse/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu["singleton"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to set vacation response: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok"}, nil
+}
+
+// ── Calendar Tools ──────────────────────────────────────────────────────────
+
+func listCalendars(_ m) (any, error) {
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Calendar/get", m{
+			"accountId":  acct,
+			"properties": []string{"id", "name", "color", "sortOrder", "isVisible", "isSubscribed", "defaultAlertsWithTime"},
+		}, "c0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Calendar/get response")
+	}
+
+	out := make([]m, len(list))
+	for i, cal := range list {
+		out[i] = m{
+			"id":           getString(cal, "id"),
+			"name":         getString(cal, "name"),
+			"color":        getString(cal, "color"),
+			"sortOrder":    getFloat(cal, "sortOrder"),
+			"isVisible":    getBool(cal, "isVisible"),
+			"isSubscribed": getBool(cal, "isSubscribed"),
+		}
+	}
+	return out, nil
+}
+
+func listEvents(params m) (any, error) {
+	after := getString(params, "after")
+	before := getString(params, "before")
+	if after == "" || before == "" {
+		return nil, errInvalidParams("after and before are required (UTC datetime strings, e.g. 2026-04-18T00:00:00Z)")
+	}
+	limit := intParam(params, "limit", 50, 200)
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	filter := m{"after": after, "before": before}
+	if calID := getString(params, "calendarId"); calID != "" {
+		filter["inCalendars"] = []string{calID}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/query", m{
+			"accountId": acct,
+			"filter":    filter,
+			"sort":      []m{{"property": "start", "isAscending": true}},
+			"limit":     limit,
+		}, "q0"},
+		[]any{"CalendarEvent/get", m{
+			"accountId": acct,
+			"#ids":      m{"resultOf": "q0", "name": "CalendarEvent/query", "path": "/ids"},
+			"properties": []string{"id", "calendarIds", "title", "start", "timeZone",
+				"duration", "showWithoutTime", "status", "freeBusyStatus",
+				"participants", "locations", "recurrenceRules", "alerts", "description"},
+		}, "g0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(responses) < 2 {
+		return nil, errToolError("Unexpected CalendarEvent response")
+	}
+	events, ok := respList(responses[1])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent response")
+	}
+
+	out := make([]m, len(events))
+	for i, ev := range events {
+		out[i] = eventSummaryDict(ev)
+	}
+	return m{"events": out}, nil
+}
+
+func getEvent(params m) (any, error) {
+	eventID := getString(params, "id")
+	if eventID == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/get", m{
+			"accountId": acct,
+			"ids":       []string{eventID},
+		}, "g0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent/get response")
+	}
+	if notFound := getStringSlice(data, "notFound"); contains(notFound, eventID) {
+		return nil, errInvalidParams("Event not found: " + eventID)
+	}
+	list := getMapSlice(data, "list")
+	if len(list) == 0 {
+		return nil, errToolError("Unexpected CalendarEvent/get response")
+	}
+	return list[0], nil
+}
+
+func createEvent(params m) (any, error) {
+	calendarID := getString(params, "calendarId")
+	if calendarID == "" {
+		return nil, errInvalidParams("calendarId is required")
+	}
+	title := getString(params, "title")
+	if title == "" {
+		return nil, errInvalidParams("title is required")
+	}
+	start := getString(params, "start")
+	if start == "" {
+		return nil, errInvalidParams("start is required (e.g. 2026-04-18T14:00:00)")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	eventObj := m{
+		"calendarIds": m{calendarID: true},
+		"title":       title,
+		"start":       start,
+	}
+	if tz := getString(params, "timeZone"); tz != "" {
+		eventObj["timeZone"] = tz
+	}
+	if dur := getString(params, "duration"); dur != "" {
+		eventObj["duration"] = dur
+	}
+	if v, ok := params["showWithoutTime"]; ok {
+		eventObj["showWithoutTime"] = v
+	}
+	if desc := getString(params, "description"); desc != "" {
+		eventObj["description"] = desc
+	}
+	if loc := getString(params, "location"); loc != "" {
+		eventObj["locations"] = m{"loc1": m{"name": loc}}
+	}
+	if v, ok := params["participants"]; ok {
+		eventObj["participants"] = v
+	}
+	if v, ok := params["alerts"]; ok {
+		eventObj["alerts"] = v
+	}
+	if v, ok := params["recurrenceRules"]; ok {
+		eventObj["recurrenceRules"] = v
+	}
+	if status := getString(params, "status"); status != "" {
+		eventObj["status"] = status
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/set", m{
+			"accountId": acct,
+			"create":    m{"ev0": eventObj},
+		}, "c0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["ev0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create event: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created", "title": title}
+	if created, ok := data["created"].(map[string]any); ok {
+		if ev, ok := created["ev0"].(map[string]any); ok {
+			result["id"] = getString(ev, "id")
+		}
+	}
+	return result, nil
+}
+
+func updateEvent(params m) (any, error) {
+	eventID := getString(params, "id")
+	if eventID == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, key := range []string{"title", "start", "timeZone", "duration", "description", "status", "freeBusyStatus"} {
+		if v, ok := params[key]; ok {
+			update[key] = v
+		}
+	}
+	if v, ok := params["showWithoutTime"]; ok {
+		update["showWithoutTime"] = v
+	}
+	if loc := getString(params, "location"); loc != "" {
+		update["locations"] = m{"loc1": m{"name": loc}}
+	}
+	if v, ok := params["participants"]; ok {
+		update["participants"] = v
+	}
+	if v, ok := params["alerts"]; ok {
+		update["alerts"] = v
+	}
+	if v, ok := params["recurrenceRules"]; ok {
+		update["recurrenceRules"] = v
+	}
+	if calID := getString(params, "calendarId"); calID != "" {
+		update["calendarIds"] = m{calID: true}
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one field to update is required")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/set", m{
+			"accountId": acct,
+			"update":    m{eventID: update},
+		}, "u0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[eventID].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update event: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": eventID}, nil
+}
+
+func deleteEvent(params m) (any, error) {
+	eventID := getString(params, "id")
+	if eventID == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/set", m{
+			"accountId": acct,
+			"destroy":   []string{eventID},
+		}, "d0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[eventID].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete event: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": eventID}, nil
+}
+
+func rsvpEvent(params m) (any, error) {
+	eventID := getString(params, "id")
+	if eventID == "" {
+		return nil, errInvalidParams("id is required")
+	}
+	status := getString(params, "status")
+	if status == "" {
+		return nil, errInvalidParams("status is required (accepted, declined, tentative, needs-action)")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch the event to find our participant entry
+	getResponses, err := jmapCall([]any{
+		[]any{"CalendarEvent/get", m{
+			"accountId":  acct,
+			"ids":        []string{eventID},
+			"properties": []string{"participants"},
+		}, "g0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+	evList := getMapSlice(must(respData(getResponses[0])), "list")
+	if len(evList) == 0 {
+		return nil, errInvalidParams("Event not found: " + eventID)
+	}
+
+	participants := getMap(evList[0], "participants")
+	if participants == nil {
+		return nil, errToolError("Event has no participants")
+	}
+
+	// Find participant matching email param, or first attendee
+	targetEmail := getString(params, "email")
+	var participantID string
+	for pid, pv := range participants {
+		if p, ok := pv.(map[string]any); ok {
+			if targetEmail != "" && getString(p, "email") == targetEmail {
+				participantID = pid
+				break
+			}
+			if roles := getMap(p, "roles"); roles != nil {
+				if _, isAttendee := roles["attendee"]; isAttendee {
+					participantID = pid
+				}
+			}
+		}
+	}
+	if participantID == "" {
+		return nil, errToolError("Could not find matching participant")
+	}
+
+	update := m{
+		"participants/" + participantID + "/participationStatus": status,
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"CalendarEvent/set", m{
+			"accountId": acct,
+			"update":    m{eventID: update},
+		}, "u0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected CalendarEvent/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[eventID].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to RSVP: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": eventID, "participationStatus": status}, nil
+}
+
+// ── Masked Email Tools ──────────────────────────────────────────────────────
+
+func listMaskedEmails(params m) (any, error) {
+	acct, err := maskedEmailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"MaskedEmail/get", m{
+			"accountId": acct,
+			"ids":       nil, // null = get all
+		}, "m0"},
+	}, maskedEmailCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected MaskedEmail/get response")
+	}
+
+	// Optional state filter
+	filterState := getString(params, "state")
+	out := make([]m, 0, len(list))
+	for _, me := range list {
+		if filterState != "" && getString(me, "state") != filterState {
+			continue
+		}
+		out = append(out, m{
+			"id":            getString(me, "id"),
+			"email":         getString(me, "email"),
+			"state":         getString(me, "state"),
+			"forDomain":     getString(me, "forDomain"),
+			"description":   getString(me, "description"),
+			"createdAt":     getString(me, "createdAt"),
+			"createdBy":     getString(me, "createdBy"),
+			"lastMessageAt": getString(me, "lastMessageAt"),
+		})
+	}
+	return out, nil
+}
+
+func createMaskedEmail(params m) (any, error) {
+	acct, err := maskedEmailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	createObj := m{"state": "enabled"}
+	if domain := getString(params, "forDomain"); domain != "" {
+		createObj["forDomain"] = domain
+	}
+	if desc := getString(params, "description"); desc != "" {
+		createObj["description"] = desc
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"MaskedEmail/set", m{
+			"accountId": acct,
+			"create":    m{"me0": createObj},
+		}, "c0"},
+	}, maskedEmailCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected MaskedEmail/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["me0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create masked email: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created"}
+	if created, ok := data["created"].(map[string]any); ok {
+		if me, ok := created["me0"].(map[string]any); ok {
+			result["id"] = getString(me, "id")
+			result["email"] = getString(me, "email")
+		}
+	}
+	return result, nil
+}
+
+func updateMaskedEmail(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := maskedEmailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	if v, ok := params["state"]; ok {
+		update["state"] = v
+	}
+	if v, ok := params["description"]; ok {
+		update["description"] = v
+	}
+	if v, ok := params["forDomain"]; ok {
+		update["forDomain"] = v
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one field to update is required (state, description, forDomain)")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"MaskedEmail/set", m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}, "u0"},
+	}, maskedEmailCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected MaskedEmail/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update masked email: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": id}, nil
+}
+
+// ── Snooze & Flag Tools ─────────────────────────────────────────────────────
+
+func snoozeEmail(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+	until := getString(params, "until")
+	if until == "" {
+		return nil, errInvalidParams("until is required (UTC datetime, e.g. 2026-04-19T09:00:00Z)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get inbox ID for moveToMailboxId default
+	moveToID := getString(params, "mailboxId")
+	if moveToID == "" {
+		// Default to inbox
+		mbResponses, err := jmapCall([]any{
+			[]any{"Mailbox/query", m{"accountId": acct, "filter": m{"role": "inbox"}}, "mq0"},
+		}, nil)
+		if err == nil && len(mbResponses) > 0 {
+			if qData, ok := respData(mbResponses[0]); ok {
+				if ids := getStringSlice(qData, "ids"); len(ids) > 0 {
+					moveToID = ids[0]
+				}
+			}
+		}
+	}
+
+	snoozed := m{"until": until}
+	if moveToID != "" {
+		snoozed["moveToMailboxId"] = moveToID
+	}
+
+	update := m{id: m{"snoozed": snoozed}}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 {
+		return nil, errToolError(fmt.Sprintf("Failed to snooze: %v", failures))
+	}
+	return m{"status": "ok", "id": id, "until": until}, nil
+}
+
+func flagEmail(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+	keyword := getString(params, "keyword")
+	if keyword == "" {
+		keyword = "$flagged"
+	}
+	set := true
+	if v, ok := params["set"].(bool); ok {
+		set = v
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, id := range ids {
+		if set {
+			update[id] = m{"keywords/" + keyword: true}
+		} else {
+			update[id] = m{"keywords/" + keyword: nil}
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to update all emails: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "keyword": keyword, "set": set}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// ── Quota Tools ─────────────────────────────────────────────────────────────
+
+func getQuota(_ m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Quota/get", m{
+			"accountId": acct,
+			"ids":       nil,
+		}, "q0"},
+	}, quotaCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Quota/get response")
+	}
+
+	out := make([]m, len(list))
+	for i, q := range list {
+		out[i] = m{
+			"id":           getString(q, "id"),
+			"resourceType": getString(q, "resourceType"),
+			"used":         getFloat(q, "used"),
+			"hardLimit":    getFloat(q, "hardLimit"),
+			"scope":        getString(q, "scope"),
+			"name":         getString(q, "name"),
+			"description":  getString(q, "description"),
+		}
+	}
+	return out, nil
+}
+
+// ── Attachment/Blob Tools ───────────────────────────────────────────────────
+
+func downloadAttachment(params m) (any, error) {
+	blobID := getString(params, "blobId")
+	if blobID == "" {
+		return nil, errInvalidParams("blobId is required")
+	}
+	name := getString(params, "name")
+	if name == "" {
+		name = "attachment"
+	}
+	mimeType := getString(params, "type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure session is loaded (populates cachedDownloadURL)
+	_, _, err = sessionFor(defaultCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	url := blobDownloadURL(acct, blobID, name, mimeType)
+	if url == "" {
+		return nil, errToolError("Download URL not available — session may not have been established")
+	}
+
+	return m{
+		"downloadUrl": url,
+		"blobId":      blobID,
+		"name":        name,
+		"type":        mimeType,
+	}, nil
+}
+
+// ── Contact CRUD Tools ──────────────────────────────────────────────────────
+
+func createContact(params m) (any, error) {
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	contactObj := m{}
+
+	// Build name
+	if nameObj, ok := params["name"].(map[string]any); ok {
+		contactObj["name"] = nameObj
+	} else {
+		// Accept simple firstName/lastName
+		nameMap := m{}
+		if v := getString(params, "firstName"); v != "" {
+			nameMap["given"] = v
+		}
+		if v := getString(params, "lastName"); v != "" {
+			nameMap["surname"] = v
+		}
+		if v := getString(params, "fullName"); v != "" {
+			nameMap["full"] = v
+		}
+		if len(nameMap) > 0 {
+			contactObj["name"] = nameMap
+		}
+	}
+
+	// Emails
+	if emails := getMapSlice(params, "emails"); len(emails) > 0 {
+		emailsMap := m{}
+		for i, e := range emails {
+			emailsMap[fmt.Sprintf("e%d", i)] = e
+		}
+		contactObj["emails"] = emailsMap
+	} else if emailStrs := getStringSlice(params, "emails"); len(emailStrs) > 0 {
+		emailsMap := m{}
+		for i, addr := range emailStrs {
+			emailsMap[fmt.Sprintf("e%d", i)] = m{"address": addr}
+		}
+		contactObj["emails"] = emailsMap
+	}
+
+	// Phones
+	if phones := getMapSlice(params, "phones"); len(phones) > 0 {
+		phonesMap := m{}
+		for i, p := range phones {
+			phonesMap[fmt.Sprintf("p%d", i)] = p
+		}
+		contactObj["phones"] = phonesMap
+	} else if phoneStrs := getStringSlice(params, "phones"); len(phoneStrs) > 0 {
+		phonesMap := m{}
+		for i, num := range phoneStrs {
+			phonesMap[fmt.Sprintf("p%d", i)] = m{"number": num}
+		}
+		contactObj["phones"] = phonesMap
+	}
+
+	// Notes
+	if notes := getString(params, "notes"); notes != "" {
+		contactObj["notes"] = m{"n0": m{"note": notes}}
+	}
+
+	// Organizations
+	if company := getString(params, "company"); company != "" {
+		contactObj["organizations"] = m{"o0": m{"name": company}}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"ContactCard/set", m{
+			"accountId": acct,
+			"create":    m{"c0": contactObj},
+		}, "c0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected ContactCard/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["c0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create contact: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created"}
+	if created, ok := data["created"].(map[string]any); ok {
+		if c, ok := created["c0"].(map[string]any); ok {
+			result["id"] = getString(c, "id")
+		}
+	}
+	return result, nil
+}
+
+func updateContact(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	if v, ok := params["name"]; ok {
+		update["name"] = v
+	}
+	if v := getString(params, "firstName"); v != "" {
+		update["name/given"] = v
+	}
+	if v := getString(params, "lastName"); v != "" {
+		update["name/surname"] = v
+	}
+	if v := getString(params, "fullName"); v != "" {
+		update["name/full"] = v
+	}
+	if v, ok := params["emails"]; ok {
+		if strs := getStringSlice(params, "emails"); len(strs) > 0 {
+			emailsMap := m{}
+			for i, addr := range strs {
+				emailsMap[fmt.Sprintf("e%d", i)] = m{"address": addr}
+			}
+			update["emails"] = emailsMap
+		} else {
+			update["emails"] = v
+		}
+	}
+	if v, ok := params["phones"]; ok {
+		if strs := getStringSlice(params, "phones"); len(strs) > 0 {
+			phonesMap := m{}
+			for i, num := range strs {
+				phonesMap[fmt.Sprintf("p%d", i)] = m{"number": num}
+			}
+			update["phones"] = phonesMap
+		} else {
+			update["phones"] = v
+		}
+	}
+	if notes := getString(params, "notes"); notes != "" {
+		update["notes"] = m{"n0": m{"note": notes}}
+	}
+	if company := getString(params, "company"); company != "" {
+		update["organizations"] = m{"o0": m{"name": company}}
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one field to update is required")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"ContactCard/set", m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}, "u0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected ContactCard/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update contact: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": id}, nil
+}
+
+func deleteContact(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"ContactCard/set", m{
+			"accountId": acct,
+			"destroy":   []string{id},
+		}, "d0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected ContactCard/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete contact: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": id}, nil
+}
+
+// ── Address Book Tools ──────────────────────────────────────────────────────
+
+func listAddressBooks(_ m) (any, error) {
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"AddressBook/get", m{
+			"accountId":  acct,
+			"properties": []string{"id", "name", "isDefault", "isSubscribed"},
+		}, "a0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected AddressBook/get response")
+	}
+
+	out := make([]m, len(list))
+	for i, ab := range list {
+		out[i] = m{
+			"id":           getString(ab, "id"),
+			"name":         getString(ab, "name"),
+			"isDefault":    getBool(ab, "isDefault"),
+			"isSubscribed": getBool(ab, "isSubscribed"),
+		}
+	}
+	return out, nil
+}
+
+// ── Identity Management Tools ───────────────────────────────────────────────
+
+func updateIdentity(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, key := range []string{"name", "textSignature", "htmlSignature"} {
+		if v, ok := params[key]; ok {
+			update[key] = v
+		}
+	}
+	if v, ok := params["replyTo"]; ok {
+		update["replyTo"] = v
+	}
+	if v, ok := params["bcc"]; ok {
+		update["bcc"] = v
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one field to update is required")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Identity/set", m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}, "u0"},
+	}, submissionCapsGlobal)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Identity/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update identity: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": id}, nil
+}
+
+// ── Email Import Tools ──────────────────────────────────────────────────────
+
+func importEmail(params m) (any, error) {
+	blobID := getString(params, "blobId")
+	if blobID == "" {
+		return nil, errInvalidParams("blobId is required (upload the RFC 5322 message first)")
+	}
+	mailboxID := getString(params, "mailboxId")
+	if mailboxID == "" {
+		return nil, errInvalidParams("mailboxId is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	importObj := m{
+		"blobId":     blobID,
+		"mailboxIds": m{mailboxID: true},
+	}
+
+	keywords := getMap(params, "keywords")
+	if keywords != nil {
+		importObj["keywords"] = keywords
+	}
+	if ra := getString(params, "receivedAt"); ra != "" {
+		importObj["receivedAt"] = ra
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/import", m{
+			"accountId": acct,
+			"emails":    m{"imp0": importObj},
+		}, "i0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Email/import response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["imp0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to import email: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "imported"}
+	if created, ok := data["created"].(map[string]any); ok {
+		if e, ok := created["imp0"].(map[string]any); ok {
+			result["id"] = getString(e, "id")
+			result["blobId"] = getString(e, "blobId")
+			result["threadId"] = getString(e, "threadId")
+		}
+	}
+	return result, nil
+}
+
+// ── Calendar Serialization Helpers ──────────────────────────────────────────
+
+func eventSummaryDict(ev m) m {
+	d := m{
+		"id":              getString(ev, "id"),
+		"title":           getString(ev, "title"),
+		"start":           getString(ev, "start"),
+		"timeZone":        getString(ev, "timeZone"),
+		"duration":        getString(ev, "duration"),
+		"showWithoutTime": getBool(ev, "showWithoutTime"),
+		"status":          getString(ev, "status"),
+		"freeBusyStatus":  getString(ev, "freeBusyStatus"),
+	}
+	if desc := getString(ev, "description"); desc != "" {
+		d["description"] = desc
+	}
+	if locs := getMap(ev, "locations"); locs != nil {
+		names := []string{}
+		for _, v := range locs {
+			if loc, ok := v.(map[string]any); ok {
+				if n := getString(loc, "name"); n != "" {
+					names = append(names, n)
+				}
+			}
+		}
+		if len(names) > 0 {
+			d["locations"] = names
+		}
+	}
+	if participants := getMap(ev, "participants"); participants != nil {
+		pList := []m{}
+		for _, v := range participants {
+			if p, ok := v.(map[string]any); ok {
+				pList = append(pList, m{
+					"name":   getString(p, "name"),
+					"email":  getString(p, "email"),
+					"status": getString(p, "participationStatus"),
+				})
+			}
+		}
+		if len(pList) > 0 {
+			d["participants"] = pList
+		}
+	}
+	return d
+}
+
+// must extracts data from respData, returning empty map on failure (for chaining).
+func must(data m, ok bool) m {
+	if !ok {
+		return m{}
+	}
+	return data
+}
+
 // ── Tool Definitions ────────────────────────────────────────────────────────
 
 var tools = []toolDefinition{
@@ -1493,9 +3010,10 @@ var tools = []toolDefinition{
 		InputSchema: m{
 			"type": "object",
 			"properties": m{
-				"query":     m{"type": "string", "description": "Search query (text or JSON JMAP filter)"},
-				"mailboxId": m{"type": "string", "description": "Optional: limit search to this mailbox"},
-				"limit":     m{"type": "integer", "description": "Max results (default 20, max 200)"},
+				"query":           m{"type": "string", "description": "Search query (text or JSON JMAP filter)"},
+				"mailboxId":       m{"type": "string", "description": "Optional: limit search to this mailbox"},
+				"limit":           m{"type": "integer", "description": "Max results (default 20, max 200)"},
+				"includeSnippets": m{"type": "boolean", "description": "Include highlighted search snippets (default false)"},
 			},
 			"required": []string{"query"},
 		},
@@ -1611,6 +3129,352 @@ var tools = []toolDefinition{
 		Description: "List sending identities (email addresses available for sending).",
 		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
 	},
+	{
+		Name:        "fm_update_identity",
+		Description: "Update a sending identity (name, signature, replyTo, bcc).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":            m{"type": "string", "description": "Identity ID"},
+				"name":          m{"type": "string", "description": "Display name"},
+				"textSignature": m{"type": "string", "description": "Plain text signature"},
+				"htmlSignature": m{"type": "string", "description": "HTML signature"},
+				"replyTo":       m{"type": "array", "description": "Reply-To addresses [{name?, email}]", "items": m{}},
+				"bcc":           m{"type": "array", "description": "Auto-BCC addresses [{name?, email}]", "items": m{}},
+			},
+			"required": []string{"id"},
+		},
+	},
+
+	// Thread
+	{
+		Name:        "fm_get_thread",
+		Description: "Get all emails in a conversation thread. Pass any email ID to get the full thread.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Any email ID in the thread"}},
+			"required":   []string{"id"},
+		},
+	},
+
+	// Mailbox Management
+	{
+		Name:        "fm_create_mailbox",
+		Description: "Create a new mailbox (folder).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"name":     m{"type": "string", "description": "Mailbox name"},
+				"parentId": m{"type": "string", "description": "Parent mailbox ID for nesting (optional)"},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "fm_rename_mailbox",
+		Description: "Rename or move a mailbox.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":       m{"type": "string", "description": "Mailbox ID"},
+				"name":     m{"type": "string", "description": "New name"},
+				"parentId": m{"type": "string", "description": "New parent ID (null for top-level)"},
+			},
+			"required": []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_delete_mailbox",
+		Description: "Delete a mailbox. Set deleteContents=true to also remove emails inside.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":             m{"type": "string", "description": "Mailbox ID to delete"},
+				"deleteContents": m{"type": "boolean", "description": "Also delete emails in the mailbox (default false)"},
+			},
+			"required": []string{"id"},
+		},
+	},
+
+	// Vacation Response
+	{
+		Name:        "fm_get_vacation_response",
+		Description: "Get the current auto-responder (vacation response) settings.",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+	{
+		Name:        "fm_set_vacation_response",
+		Description: "Enable, disable, or configure the auto-responder (vacation response).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"isEnabled": m{"type": "boolean", "description": "Enable or disable auto-reply"},
+				"subject":   m{"type": "string", "description": "Auto-reply subject"},
+				"textBody":  m{"type": "string", "description": "Auto-reply plain text body"},
+				"htmlBody":  m{"type": "string", "description": "Auto-reply HTML body"},
+				"fromDate":  m{"type": "string", "description": "Start date (UTC, e.g. 2026-04-20T00:00:00Z). Null for immediate."},
+				"toDate":    m{"type": "string", "description": "End date (UTC). Null for indefinite."},
+			},
+			"required": []string{},
+		},
+	},
+
+	// Calendar
+	{
+		Name:        "fm_list_calendars",
+		Description: "List all calendars with name, color, and visibility.",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+	{
+		Name:        "fm_list_events",
+		Description: "List calendar events in a date range.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"after":      m{"type": "string", "description": "Start of range (UTC, e.g. 2026-04-18T00:00:00Z)"},
+				"before":     m{"type": "string", "description": "End of range (UTC)"},
+				"calendarId": m{"type": "string", "description": "Limit to this calendar (optional)"},
+				"limit":      m{"type": "integer", "description": "Max events (default 50, max 200)"},
+			},
+			"required": []string{"after", "before"},
+		},
+	},
+	{
+		Name:        "fm_get_event",
+		Description: "Get full calendar event details by ID.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Event ID"}},
+			"required":   []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_create_event",
+		Description: "Create a calendar event.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"calendarId":      m{"type": "string", "description": "Calendar ID to create in"},
+				"title":           m{"type": "string", "description": "Event title"},
+				"start":           m{"type": "string", "description": "Start time (e.g. 2026-04-18T14:00:00)"},
+				"timeZone":        m{"type": "string", "description": "IANA timezone (e.g. America/New_York)"},
+				"duration":        m{"type": "string", "description": "ISO 8601 duration (e.g. PT1H, P1D)"},
+				"showWithoutTime": m{"type": "boolean", "description": "All-day event (default false)"},
+				"description":     m{"type": "string", "description": "Event description"},
+				"location":        m{"type": "string", "description": "Location name"},
+				"status":          m{"type": "string", "description": "confirmed, tentative, or cancelled"},
+				"participants":    m{"type": "object", "description": "Participants map (JSCalendar format)"},
+				"alerts":          m{"type": "object", "description": "Alerts map (JSCalendar format)"},
+				"recurrenceRules": m{"type": "array", "description": "Recurrence rules (JSCalendar format)"},
+			},
+			"required": []string{"calendarId", "title", "start"},
+		},
+	},
+	{
+		Name:        "fm_update_event",
+		Description: "Update a calendar event. Only provided fields are changed.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":              m{"type": "string", "description": "Event ID"},
+				"title":           m{"type": "string", "description": "New title"},
+				"start":           m{"type": "string", "description": "New start time"},
+				"timeZone":        m{"type": "string", "description": "New timezone"},
+				"duration":        m{"type": "string", "description": "New duration"},
+				"showWithoutTime": m{"type": "boolean", "description": "All-day event"},
+				"description":     m{"type": "string", "description": "New description"},
+				"location":        m{"type": "string", "description": "New location"},
+				"status":          m{"type": "string", "description": "New status"},
+				"calendarId":      m{"type": "string", "description": "Move to different calendar"},
+				"participants":    m{"type": "object", "description": "Updated participants"},
+				"alerts":          m{"type": "object", "description": "Updated alerts"},
+				"recurrenceRules": m{"type": "array", "description": "Updated recurrence"},
+			},
+			"required": []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_delete_event",
+		Description: "Delete a calendar event.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Event ID"}},
+			"required":   []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_rsvp_event",
+		Description: "Respond to a calendar event invitation (accept, decline, tentative).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":     m{"type": "string", "description": "Event ID"},
+				"status": m{"type": "string", "description": "accepted, declined, tentative, or needs-action"},
+				"email":  m{"type": "string", "description": "Your email (to match participant entry). Optional if only one attendee."},
+			},
+			"required": []string{"id", "status"},
+		},
+	},
+
+	// Masked Email
+	{
+		Name:        "fm_list_masked_emails",
+		Description: "List all masked email aliases (Fastmail anonymous addresses).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"state": m{"type": "string", "description": "Filter by state: enabled, disabled, pending, deleted (optional)"},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "fm_create_masked_email",
+		Description: "Create a new masked email alias. Returns the generated address.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"forDomain":   m{"type": "string", "description": "Domain/website this alias is for (optional)"},
+				"description": m{"type": "string", "description": "Description/note (optional)"},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "fm_update_masked_email",
+		Description: "Update a masked email alias (enable, disable, change description).",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":          m{"type": "string", "description": "Masked email ID"},
+				"state":       m{"type": "string", "description": "New state: enabled, disabled, deleted"},
+				"description": m{"type": "string", "description": "New description"},
+				"forDomain":   m{"type": "string", "description": "New associated domain"},
+			},
+			"required": []string{"id"},
+		},
+	},
+
+	// Snooze & Flag
+	{
+		Name:        "fm_snooze_email",
+		Description: "Snooze an email to reappear later. Uses Fastmail's snooze extension.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":        m{"type": "string", "description": "Email ID to snooze"},
+				"until":     m{"type": "string", "description": "When to unsnooze (UTC datetime, e.g. 2026-04-19T09:00:00Z)"},
+				"mailboxId": m{"type": "string", "description": "Mailbox to return to (default: Inbox)"},
+			},
+			"required": []string{"id", "until"},
+		},
+	},
+	{
+		Name:        "fm_flag_email",
+		Description: "Set or remove a keyword/flag on email(s). Common keywords: $flagged (star), $answered, $forwarded, or any custom keyword.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids":     m{"type": "array", "description": "Email IDs", "items": m{"type": "string"}},
+				"keyword": m{"type": "string", "description": "Keyword to set/remove (default: $flagged)"},
+				"set":     m{"type": "boolean", "description": "true = add keyword, false = remove (default true)"},
+			},
+			"required": []string{"ids"},
+		},
+	},
+
+	// Quota
+	{
+		Name:        "fm_get_quota",
+		Description: "Get account storage quota (used and limit).",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+
+	// Attachment/Blob
+	{
+		Name:        "fm_download_attachment",
+		Description: "Get a download URL for an email attachment. Use blobId from fm_get_email's attachments array.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"blobId": m{"type": "string", "description": "Blob ID of the attachment"},
+				"name":   m{"type": "string", "description": "Filename (optional)"},
+				"type":   m{"type": "string", "description": "MIME type (optional, default application/octet-stream)"},
+			},
+			"required": []string{"blobId"},
+		},
+	},
+
+	// Contact CRUD
+	{
+		Name:        "fm_create_contact",
+		Description: "Create a new contact. Accepts simple fields (firstName, lastName, emails as strings) or full JSContact format.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"firstName": m{"type": "string", "description": "Given name"},
+				"lastName":  m{"type": "string", "description": "Surname"},
+				"fullName":  m{"type": "string", "description": "Full display name (alternative to first/last)"},
+				"name":      m{"type": "object", "description": "Full JSContact name object (alternative to simple fields)"},
+				"emails":    m{"type": "array", "description": "Email addresses: [\"addr\"] or [{address, label}]", "items": m{}},
+				"phones":    m{"type": "array", "description": "Phone numbers: [\"number\"] or [{number, label}]", "items": m{}},
+				"company":   m{"type": "string", "description": "Company/organization name"},
+				"notes":     m{"type": "string", "description": "Free-text notes"},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "fm_update_contact",
+		Description: "Update a contact. Only provided fields are changed.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":        m{"type": "string", "description": "Contact ID"},
+				"firstName": m{"type": "string", "description": "Given name"},
+				"lastName":  m{"type": "string", "description": "Surname"},
+				"fullName":  m{"type": "string", "description": "Full display name"},
+				"name":      m{"type": "object", "description": "Full JSContact name object"},
+				"emails":    m{"type": "array", "description": "Email addresses", "items": m{}},
+				"phones":    m{"type": "array", "description": "Phone numbers", "items": m{}},
+				"company":   m{"type": "string", "description": "Company/organization"},
+				"notes":     m{"type": "string", "description": "Notes"},
+			},
+			"required": []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_delete_contact",
+		Description: "Delete a contact.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Contact ID"}},
+			"required":   []string{"id"},
+		},
+	},
+
+	// Address Books
+	{
+		Name:        "fm_list_address_books",
+		Description: "List contact address books.",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+
+	// Email Import
+	{
+		Name:        "fm_import_email",
+		Description: "Import a raw RFC 5322 email message from a previously uploaded blob.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"blobId":     m{"type": "string", "description": "Blob ID of the uploaded RFC 5322 message"},
+				"mailboxId":  m{"type": "string", "description": "Mailbox to import into"},
+				"keywords":   m{"type": "object", "description": "Keywords to set (e.g. {\"$seen\": true})"},
+				"receivedAt": m{"type": "string", "description": "Override received date (UTC datetime)"},
+			},
+			"required": []string{"blobId", "mailboxId"},
+		},
+	},
 }
 
 // ── Tool Dispatch ───────────────────────────────────────────────────────────
@@ -1618,6 +3482,7 @@ var tools = []toolDefinition{
 type toolFunc func(m) (any, error)
 
 var toolHandlers = map[string]toolFunc{
+	// Email
 	"fm_list_mailboxes":       listMailboxes,
 	"fm_list_emails":          listEmails,
 	"fm_get_email":            getEmail,
@@ -1626,11 +3491,49 @@ var toolHandlers = map[string]toolFunc{
 	"fm_mark_read":            markRead,
 	"fm_move_email":           moveEmail,
 	"fm_delete_email":         deleteEmail,
+	// Thread
+	"fm_get_thread":           getThread,
+	// Mailbox Management
+	"fm_create_mailbox":       createMailbox,
+	"fm_rename_mailbox":       renameMailbox,
+	"fm_delete_mailbox":       deleteMailbox,
+	// Bridge
 	"fm_list_bridge_messages": listBridgeMessages,
 	"fm_ack_bridge_message":   ackBridgeMessage,
+	// Calendar
+	"fm_list_calendars":       listCalendars,
+	"fm_list_events":          listEvents,
+	"fm_get_event":            getEvent,
+	"fm_create_event":         createEvent,
+	"fm_update_event":         updateEvent,
+	"fm_delete_event":         deleteEvent,
+	"fm_rsvp_event":           rsvpEvent,
+	// Contacts
 	"fm_list_contacts":        listContacts,
 	"fm_get_contact":          getContact,
+	"fm_create_contact":       createContact,
+	"fm_update_contact":       updateContact,
+	"fm_delete_contact":       deleteContact,
+	"fm_list_address_books":   listAddressBooks,
+	// Identity
 	"fm_list_identities":      listIdentities,
+	"fm_update_identity":      updateIdentity,
+	// Masked Email
+	"fm_list_masked_emails":   listMaskedEmails,
+	"fm_create_masked_email":  createMaskedEmail,
+	"fm_update_masked_email":  updateMaskedEmail,
+	// Vacation
+	"fm_get_vacation_response": getVacationResponse,
+	"fm_set_vacation_response": setVacationResponse,
+	// Snooze & Flag
+	"fm_snooze_email":         snoozeEmail,
+	"fm_flag_email":           flagEmail,
+	// Quota
+	"fm_get_quota":            getQuota,
+	// Attachment
+	"fm_download_attachment":  downloadAttachment,
+	// Import
+	"fm_import_email":         importEmail,
 }
 
 func callTool(name string, arguments m) (any, error) {
@@ -1690,7 +3593,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "1.0.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.0.0"},
 		})
 
 	case "notifications/initialized":
