@@ -308,6 +308,89 @@ var submissionCapsGlobal = []string{
 	"urn:ietf:params:jmap:submission",
 }
 
+var sieveCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:sieve",
+}
+
+func sieveAccountID() (string, error) {
+	_, id, err := sessionFor(sieveCaps)
+	return id, err
+}
+
+// uploadBlob uploads text content as a blob and returns the blobId.
+func uploadBlob(accountID, content, contentType string) (string, error) {
+	sessionMu.Lock()
+	tpl := cachedUploadURL
+	sessionMu.Unlock()
+	if tpl == "" {
+		// Ensure session is loaded
+		if _, _, err := sessionFor(defaultCaps); err != nil {
+			return "", err
+		}
+		sessionMu.Lock()
+		tpl = cachedUploadURL
+		sessionMu.Unlock()
+	}
+	if tpl == "" {
+		return "", errToolError("Upload URL not available")
+	}
+
+	uploadURL := strings.Replace(tpl, "{accountId}", url.PathEscape(accountID), 1)
+
+	token, err := bearerToken()
+	if err != nil {
+		return "", err
+	}
+
+	req, _ := http.NewRequest("POST", uploadURL, strings.NewReader(content))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+
+	data, statusCode, err := doHTTPWithRetry(req, 1)
+	if err != nil {
+		return "", err
+	}
+	if statusCode != 200 && statusCode != 201 {
+		return "", errToolError(fmt.Sprintf("Blob upload failed: HTTP %d", statusCode))
+	}
+
+	var result m
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", errToolError("Blob upload: unexpected response")
+	}
+	blobID := getString(result, "blobId")
+	if blobID == "" {
+		return "", errToolError("Blob upload: no blobId in response")
+	}
+	return blobID, nil
+}
+
+// downloadBlobText downloads a blob and returns its content as a string.
+func downloadBlobText(accountID, blobID string) (string, error) {
+	dlURL := blobDownloadURL(accountID, blobID, "script.sieve", "application/sieve")
+	if dlURL == "" {
+		return "", errToolError("Download URL not available")
+	}
+
+	token, err := bearerToken()
+	if err != nil {
+		return "", err
+	}
+
+	req, _ := http.NewRequest("GET", dlURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	data, statusCode, err := doHTTPWithRetry(req, 1)
+	if err != nil {
+		return "", err
+	}
+	if statusCode != 200 {
+		return "", errToolError(fmt.Sprintf("Blob download failed: HTTP %d", statusCode))
+	}
+	return string(data), nil
+}
+
 // blobDownloadURL builds the download URL for a blob.
 // Name and type are URL-encoded to prevent URL structure manipulation.
 func blobDownloadURL(accountID, blobID, name, mimeType string) string {
@@ -2969,6 +3052,314 @@ func importEmail(params m) (any, error) {
 	return result, nil
 }
 
+// ── Sieve Filter Tools ──────────────────────────────────────────────────────
+
+func listSieveScripts(_ m) (any, error) {
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/get", m{
+			"accountId": acct,
+			"ids":       nil, // null = get all
+		}, "s0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	list, ok := respList(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/get response")
+	}
+
+	out := make([]m, len(list))
+	for i, s := range list {
+		out[i] = m{
+			"id":       getString(s, "id"),
+			"name":     s["name"], // can be null
+			"isActive": getBool(s, "isActive"),
+			"blobId":   getString(s, "blobId"),
+		}
+	}
+	return out, nil
+}
+
+func getSieveScript(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/get", m{
+			"accountId": acct,
+			"ids":       []string{id},
+		}, "s0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/get response")
+	}
+	if notFound := getStringSlice(data, "notFound"); contains(notFound, id) {
+		return nil, errInvalidParams("Sieve script not found: " + id)
+	}
+	list := getMapSlice(data, "list")
+	if len(list) == 0 {
+		return nil, errToolError("Unexpected SieveScript/get response")
+	}
+
+	script := list[0]
+	blobID := getString(script, "blobId")
+
+	// Download the script content
+	content, err := downloadBlobText(acct, blobID)
+	if err != nil {
+		return nil, err
+	}
+
+	return m{
+		"id":       getString(script, "id"),
+		"name":     script["name"],
+		"isActive": getBool(script, "isActive"),
+		"content":  content,
+	}, nil
+}
+
+func setSieveScript(params m) (any, error) {
+	content := getString(params, "content")
+	if content == "" {
+		return nil, errInvalidParams("content is required (Sieve script source)")
+	}
+
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Upload script content as a blob
+	blobID, err := uploadBlob(acct, content, "application/sieve")
+	if err != nil {
+		return nil, err
+	}
+
+	id := getString(params, "id")
+	activate := getBool(params, "activate")
+
+	var setArgs m
+
+	if id != "" {
+		// Update existing script
+		update := m{"blobId": blobID}
+		if v, ok := params["name"]; ok {
+			update["name"] = v
+		}
+		setArgs = m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}
+		if activate {
+			setArgs["onSuccessActivateScript"] = id
+		}
+	} else {
+		// Create new script
+		createObj := m{"blobId": blobID}
+		if name := getString(params, "name"); name != "" {
+			createObj["name"] = name
+		}
+		setArgs = m{
+			"accountId": acct,
+			"create":    m{"sv0": createObj},
+		}
+		if activate {
+			setArgs["onSuccessActivateScript"] = "#sv0"
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/set", setArgs, "c0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/set response")
+	}
+
+	// Check for errors
+	if id != "" {
+		if nu, ok := data["notUpdated"].(map[string]any); ok {
+			if errObj, ok := nu[id].(map[string]any); ok {
+				return nil, errToolError(fmt.Sprintf("Failed to update script: %s — %s",
+					getString(errObj, "type"), getString(errObj, "description")))
+			}
+		}
+		return m{"status": "updated", "id": id, "activated": activate}, nil
+	}
+
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["sv0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create script: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created", "activated": activate}
+	if created, ok := data["created"].(map[string]any); ok {
+		if s, ok := created["sv0"].(map[string]any); ok {
+			result["id"] = getString(s, "id")
+		}
+	}
+	return result, nil
+}
+
+func deleteSieveScript(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Deactivate first (can't destroy an active script), then destroy
+	setArgs := m{
+		"accountId":                 acct,
+		"onSuccessDeactivateScript": true,
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/set", setArgs, "deact0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+	// Ignore deactivation result — may not have been active
+
+	// Now destroy
+	responses, err = jmapCall([]any{
+		[]any{"SieveScript/set", m{
+			"accountId": acct,
+			"destroy":   []string{id},
+		}, "d0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete script: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": id}, nil
+}
+
+func activateSieveScript(params m) (any, error) {
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	id := getString(params, "id")
+	setArgs := m{"accountId": acct}
+
+	if id == "" {
+		// Deactivate all
+		setArgs["onSuccessDeactivateScript"] = true
+	} else {
+		// Activate specific script
+		setArgs["onSuccessActivateScript"] = id
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/set", setArgs, "a0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/set response")
+	}
+	// Check for accountId-level error
+	if errType := getString(data, "type"); errType != "" {
+		return nil, errToolError(fmt.Sprintf("Failed to activate: %s — %s",
+			errType, getString(data, "description")))
+	}
+
+	if id == "" {
+		return m{"status": "deactivated"}, nil
+	}
+	return m{"status": "activated", "id": id}, nil
+}
+
+func validateSieveScript(params m) (any, error) {
+	content := getString(params, "content")
+	if content == "" {
+		return nil, errInvalidParams("content is required (Sieve script source)")
+	}
+
+	acct, err := sieveAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Upload as blob first
+	blobID, err := uploadBlob(acct, content, "application/sieve")
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/validate", m{
+			"accountId": acct,
+			"blobId":    blobID,
+		}, "v0"},
+	}, sieveCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected SieveScript/validate response")
+	}
+
+	if errObj := data["error"]; errObj != nil {
+		if e, ok := errObj.(map[string]any); ok {
+			return m{
+				"valid":       false,
+				"error":       getString(e, "type"),
+				"description": getString(e, "description"),
+			}, nil
+		}
+		return m{"valid": false, "error": fmt.Sprintf("%v", errObj)}, nil
+	}
+
+	return m{"valid": true}, nil
+}
+
 // ── Calendar Serialization Helpers ──────────────────────────────────────────
 
 func eventSummaryDict(ev m) m {
@@ -3527,6 +3918,70 @@ var tools = []toolDefinition{
 			"required": []string{"blobId", "mailboxId"},
 		},
 	},
+
+	// Sieve Filter Management
+	{
+		Name:        "fm_list_sieve_scripts",
+		Description: "List all Sieve filter scripts with name and active status.",
+		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+	{
+		Name:        "fm_get_sieve_script",
+		Description: "Get a Sieve script by ID, including the full script source code.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Script ID"}},
+			"required":   []string{"id"},
+		},
+	},
+	{
+		Name: "fm_set_sieve_script",
+		Description: `Create or update a Sieve filter script. Provide the full Sieve source in 'content'.
+If 'id' is provided, updates that script; otherwise creates a new one. Set activate=true to make it the active script.
+Fastmail Sieve supports: fileinto, reject, vacation, body, regex, variables, imap4flags, editheader, duplicate,
+vnd.cyrus.jmapquery (use JMAP filter syntax in Sieve!), vnd.cyrus.snooze, and many more.`,
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"content":  m{"type": "string", "description": "Full Sieve script source code"},
+				"name":     m{"type": "string", "description": "Script name (must be unique)"},
+				"id":       m{"type": "string", "description": "Script ID to update (omit to create new)"},
+				"activate": m{"type": "boolean", "description": "Activate this script after saving (default false)"},
+			},
+			"required": []string{"content"},
+		},
+	},
+	{
+		Name:        "fm_delete_sieve_script",
+		Description: "Delete a Sieve script. Automatically deactivates it first if active.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Script ID to delete"}},
+			"required":   []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_activate_sieve_script",
+		Description: "Activate a Sieve script (only one can be active). Omit id to deactivate all scripts.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id": m{"type": "string", "description": "Script ID to activate (omit to deactivate all)"},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "fm_validate_sieve_script",
+		Description: "Validate Sieve script syntax without saving. Returns valid=true or error details.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"content": m{"type": "string", "description": "Sieve script source to validate"},
+			},
+			"required": []string{"content"},
+		},
+	},
 }
 
 // ── Tool Dispatch ───────────────────────────────────────────────────────────
@@ -3586,6 +4041,13 @@ var toolHandlers = map[string]toolFunc{
 	"fm_download_attachment":  downloadAttachment,
 	// Import
 	"fm_import_email":         importEmail,
+	// Sieve
+	"fm_list_sieve_scripts":   listSieveScripts,
+	"fm_get_sieve_script":     getSieveScript,
+	"fm_set_sieve_script":     setSieveScript,
+	"fm_delete_sieve_script":  deleteSieveScript,
+	"fm_activate_sieve_script": activateSieveScript,
+	"fm_validate_sieve_script": validateSieveScript,
 }
 
 func callTool(name string, arguments m) (any, error) {
@@ -3646,7 +4108,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.0.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.1.0"},
 		})
 
 	case "notifications/initialized":

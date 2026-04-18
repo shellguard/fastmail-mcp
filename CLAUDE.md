@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A single-file Go MCP server (`main.go`) that exposes Fastmail email, contacts, calendars, masked email, and more as MCP tools via the JMAP API. No external dependencies — stdlib only.
+A single-file Go MCP server (`main.go`) that exposes Fastmail email, contacts, calendars, masked email, Sieve filters, and more as MCP tools via the JMAP API. No external dependencies — stdlib only.
 
 Cross-platform: builds for macOS, Windows, and Linux from a single codebase.
 
@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (39 total)
+## Tools (45 total)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -109,6 +109,14 @@ All JMAP calls follow this pattern:
 ### Quota (1)
 - `fm_get_quota` — storage usage and limits
 
+### Sieve Filters (6)
+- `fm_list_sieve_scripts` — list all Sieve scripts with name and active status
+- `fm_get_sieve_script` — get script by ID with full source code
+- `fm_set_sieve_script` — create or update a script; params: content, name, id (for update), activate
+- `fm_delete_sieve_script` — delete a script (auto-deactivates if active)
+- `fm_activate_sieve_script` — activate a script by ID, or deactivate all (omit id)
+- `fm_validate_sieve_script` — validate syntax without saving; params: content
+
 ### Attachment (1)
 - `fm_download_attachment` — get download URL for attachment; params: blobId, name, type
 
@@ -124,6 +132,7 @@ All JMAP calls follow this pattern:
 | Contacts | `https://www.fastmail.com/dev/contacts` |
 | Calendars | `https://www.fastmail.com/dev/calendars` |
 | Masked Email | `https://www.fastmail.com/dev/maskedemail` |
+| Sieve | `urn:ietf:params:jmap:sieve` (RFC 9661) |
 
 ## Adding a New Tool
 
@@ -143,6 +152,9 @@ All JMAP calls follow this pattern:
 - Calendar tools use JSCalendar format (RFC 8984) for events
 - Contact tools accept both simple fields (`firstName`, `emails` as strings) and full JSContact format
 - Masked email uses Fastmail's proprietary extension (`MaskedEmail/get`, `MaskedEmail/set`)
+- Sieve tools use blob upload/download for script content (RFC 9661 pattern)
+- Sieve scripts support `vnd.cyrus.jmapquery` for JMAP filter syntax inside Sieve rules
+- Only one Sieve script can be active at a time; activation is atomic via `onSuccessActivateScript`
 - Snooze uses Fastmail's proprietary `snoozed` property on Email
 - Limit params are capped at 200 to prevent oversized JMAP responses
 - JSON-RPC notifications (no `id`) never receive responses
