@@ -3160,6 +3160,295 @@ func flagEmail(params m) (any, error) {
 	return result, nil
 }
 
+// ── Spam Reporting Tools ────────────────────────────────────────────────────
+
+// reportSpam moves emails to Junk and sets $junk keyword to train Fastmail's spam filter.
+func reportSpam(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Find Junk mailbox
+	junkID, err := findMailboxByRole(acct, "junk")
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, id := range ids {
+		update[id] = m{
+			"mailboxIds":      m{junkID: true},
+			"keywords/$junk":  true,
+			"keywords/$seen":  true, // mark read — no need to see spam again
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to report all as spam: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "movedTo": "Junk", "action": "reported as spam"}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// reportPhishing moves emails to Junk and sets $phishing keyword.
+func reportPhishing(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	junkID, err := findMailboxByRole(acct, "junk")
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, id := range ids {
+		update[id] = m{
+			"mailboxIds":         m{junkID: true},
+			"keywords/$phishing": true,
+			"keywords/$junk":     true,
+			"keywords/$seen":     true,
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to report all as phishing: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "movedTo": "Junk", "action": "reported as phishing"}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// reportNotSpam moves emails out of Junk, removes $junk, sets $notjunk.
+func reportNotSpam(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Move to Inbox by default, or specified mailbox
+	destID := getString(params, "mailboxId")
+	if destID == "" {
+		var err error
+		destID, err = findMailboxByRole(acct, "inbox")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	update := m{}
+	for _, id := range ids {
+		update[id] = m{
+			"mailboxIds":        m{destID: true},
+			"keywords/$notjunk": true,
+			"keywords/$junk":    nil,
+			"keywords/$phishing": nil,
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to report all as not spam: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "action": "reported as not spam"}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// ── Archive & Destroy Tools ─────────────────────────────────────────────────
+
+// archiveEmail moves emails to the Archive mailbox.
+func archiveEmail(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	archiveID, err := findMailboxByRole(acct, "archive")
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, id := range ids {
+		update[id] = m{"mailboxIds": m{archiveID: true}}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to archive all emails: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "movedTo": "Archive"}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// destroyEmail permanently deletes emails (bypasses Trash).
+func destroyEmail(params m) (any, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{
+			"accountId": acct,
+			"destroy":   ids,
+		}, "d0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Email/set response")
+	}
+
+	var failures map[string]string
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		failures = map[string]string{}
+		for id, errObj := range nd {
+			if e, ok := errObj.(map[string]any); ok {
+				failures[id] = getString(e, "type") + ": " + getString(e, "description")
+			} else {
+				failures[id] = "unknown error"
+			}
+		}
+	}
+
+	if len(failures) > 0 && len(failures) == len(ids) {
+		return nil, errToolError(fmt.Sprintf("Failed to destroy all emails: %v", failures))
+	}
+	result := m{"status": "ok", "ids": ids, "action": "permanently deleted"}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	return result, nil
+}
+
+// unsnoozeEmail clears the snooze on an email.
+func unsnoozeEmail(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{id: m{"snoozed": nil}}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	failures := checkNotUpdated(responses)
+	if len(failures) > 0 {
+		return nil, errToolError(fmt.Sprintf("Failed to unsnooze: %v", failures))
+	}
+	return m{"status": "ok", "id": id, "action": "unsnoozed"}, nil
+}
+
+// findMailboxByRole finds a mailbox ID by its role (inbox, junk, archive, trash, etc.)
+func findMailboxByRole(acct, role string) (string, error) {
+	responses, err := jmapCall([]any{
+		[]any{"Mailbox/query", m{"accountId": acct, "filter": m{"role": role}}, "mq0"},
+		[]any{"Mailbox/get", m{
+			"accountId":  acct,
+			"#ids":       m{"resultOf": "mq0", "name": "Mailbox/query", "path": "/ids"},
+			"properties": []string{"id"},
+		}, "mg0"},
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if len(responses) < 2 {
+		return "", errToolError(fmt.Sprintf("Could not find %s mailbox", role))
+	}
+	list, ok := respList(responses[1])
+	if !ok || len(list) == 0 {
+		return "", errToolError(fmt.Sprintf("Could not find %s mailbox", role))
+	}
+	id := getString(list[0], "id")
+	if id == "" {
+		return "", errToolError(fmt.Sprintf("Could not find %s mailbox", role))
+	}
+	return id, nil
+}
+
 // ── Quota Tools ─────────────────────────────────────────────────────────────
 
 func getQuota(_ m) (any, error) {
@@ -4512,6 +4801,75 @@ var tools = []toolDefinition{
 		Description: "Get the server's supported Sieve extensions and limits. Use before writing Sieve scripts to know which features are available (e.g. vnd.cyrus.jmapquery, regex, editheader).",
 		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
 	},
+	// Spam Reporting
+	{
+		Name:        "fm_report_spam",
+		Description: "Report email(s) as spam. Moves to Junk, sets $junk keyword to train Fastmail's spam filter, and marks as read. Prefer this over unsubscribing — unsubscribing confirms a live address to spammers.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids": m{"type": "array", "description": "Email IDs to report as spam", "items": m{"type": "string"}},
+			},
+			"required": []string{"ids"},
+		},
+	},
+	{
+		Name:        "fm_report_phishing",
+		Description: "Report email(s) as phishing. Moves to Junk, sets $phishing and $junk keywords. Use for fraudulent emails impersonating legitimate senders.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids": m{"type": "array", "description": "Email IDs to report as phishing", "items": m{"type": "string"}},
+			},
+			"required": []string{"ids"},
+		},
+	},
+	{
+		Name:        "fm_report_not_spam",
+		Description: "Report email(s) as not spam (false positive). Moves out of Junk, removes $junk/$phishing keywords, sets $notjunk to train the filter.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids":       m{"type": "array", "description": "Email IDs to report as not spam", "items": m{"type": "string"}},
+				"mailboxId": m{"type": "string", "description": "Destination mailbox (default: Inbox)"},
+			},
+			"required": []string{"ids"},
+		},
+	},
+
+	// Archive & Destroy
+	{
+		Name:        "fm_archive_email",
+		Description: "Move email(s) to the Archive mailbox.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids": m{"type": "array", "description": "Email IDs to archive", "items": m{"type": "string"}},
+			},
+			"required": []string{"ids"},
+		},
+	},
+	{
+		Name:        "fm_destroy_email",
+		Description: "Permanently delete email(s), bypassing Trash. Cannot be undone. Use fm_delete_email for recoverable deletion.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"ids": m{"type": "array", "description": "Email IDs to permanently delete", "items": m{"type": "string"}},
+			},
+			"required": []string{"ids"},
+		},
+	},
+	{
+		Name:        "fm_unsnooze_email",
+		Description: "Clear the snooze on an email, returning it to its current mailbox immediately.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Email ID to unsnooze"}},
+			"required":   []string{"id"},
+		},
+	},
+
 	{
 		Name:        "fm_find_duplicates",
 		Description: "Scan a mailbox for duplicate emails. Groups by Message-ID header (or subject+from+date fallback). Returns duplicate groups with suggested IDs to keep/delete. Use with fm_delete_email to remove duplicates.",
@@ -4653,6 +5011,14 @@ var toolHandlers = map[string]toolFunc{
 	"fm_get_mailbox_stats":     getMailboxStats,
 	"fm_get_sieve_capabilities": getSieveCapabilities,
 	"fm_find_duplicates":        findDuplicates,
+	// Spam Reporting
+	"fm_report_spam":           reportSpam,
+	"fm_report_phishing":       reportPhishing,
+	"fm_report_not_spam":       reportNotSpam,
+	// Archive & Destroy
+	"fm_archive_email":         archiveEmail,
+	"fm_destroy_email":         destroyEmail,
+	"fm_unsnooze_email":        unsnoozeEmail,
 	// Sieve
 	"fm_list_sieve_scripts":   listSieveScripts,
 	"fm_get_sieve_script":     getSieveScript,

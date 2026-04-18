@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (50 total)
+## Tools (56 total)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -101,6 +101,16 @@ All JMAP calls follow this pattern:
 ### Vacation Response (2)
 - `fm_get_vacation_response` — current auto-responder settings
 - `fm_set_vacation_response` — configure auto-responder; params: isEnabled, subject, textBody, fromDate, toDate
+
+### Spam Reporting (3)
+- `fm_report_spam` — move to Junk + set `$junk` keyword to train filter (batch)
+- `fm_report_phishing` — move to Junk + set `$phishing` + `$junk` keywords (batch)
+- `fm_report_not_spam` — move to Inbox + set `$notjunk`, remove `$junk`/`$phishing` (batch)
+
+### Archive & Lifecycle (3)
+- `fm_archive_email` — move to Archive mailbox (batch)
+- `fm_destroy_email` — permanent delete, bypasses Trash (batch, irreversible)
+- `fm_unsnooze_email` — clear snooze, return email immediately
 
 ### Snooze & Flags (2)
 - `fm_snooze_email` — snooze email; params: id, until, mailboxId
@@ -159,6 +169,10 @@ All JMAP calls follow this pattern:
 - Calendar tools use JSCalendar format (RFC 8984) for events
 - Contact tools accept both simple fields (`firstName`, `emails` as strings) and full JSContact format
 - Masked email uses Fastmail's proprietary extension (`MaskedEmail/get`, `MaskedEmail/set`)
+- `fm_report_spam` sets `$junk` keyword which trains Fastmail's Bayesian spam filter (Cyrus)
+- `fm_report_phishing` sets both `$phishing` and `$junk` — flagged separately for Fastmail's abuse team
+- Never unsubscribe from spam — use `fm_report_spam` instead (unsubscribing confirms a live address)
+- `fm_destroy_email` uses `Email/set destroy` for permanent deletion (vs `fm_delete_email` which moves to Trash)
 - `fm_get_mailbox_stats` paginates internally (up to 5 JMAP calls) to scan up to 1000 emails
 - `fm_list_email_ids` returns minimal fields for fast triage (up to 1000/call, vs 200 for full emails)
 - `fm_batch_get_emails` caps at 50 per call with 256KB body limit per email
