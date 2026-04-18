@@ -4197,6 +4197,460 @@ func validateSieveScript(params m) (any, error) {
 	return m{"valid": true}, nil
 }
 
+// ── Calendar Management Tools ───────────────────────────────────────────────
+
+func createCalendar(params m) (any, error) {
+	name := getString(params, "name")
+	if name == "" {
+		return nil, errInvalidParams("name is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	createObj := m{"name": name}
+	if color := getString(params, "color"); color != "" {
+		createObj["color"] = color
+	}
+	if v, ok := params["isVisible"]; ok {
+		createObj["isVisible"] = v
+	}
+	if v, ok := params["sortOrder"]; ok {
+		createObj["sortOrder"] = v
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Calendar/set", m{
+			"accountId": acct,
+			"create":    m{"cal0": createObj},
+		}, "c0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Calendar/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["cal0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create calendar: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created", "name": name}
+	if created, ok := data["created"].(map[string]any); ok {
+		if cal, ok := created["cal0"].(map[string]any); ok {
+			result["id"] = getString(cal, "id")
+		}
+	}
+	return result, nil
+}
+
+func updateCalendar(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	update := m{}
+	for _, key := range []string{"name", "color"} {
+		if v, ok := params[key]; ok {
+			update[key] = v
+		}
+	}
+	if v, ok := params["isVisible"]; ok {
+		update["isVisible"] = v
+	}
+	if v, ok := params["sortOrder"]; ok {
+		update["sortOrder"] = v
+	}
+
+	if len(update) == 0 {
+		return nil, errInvalidParams("at least one field to update is required")
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Calendar/set", m{
+			"accountId": acct,
+			"update":    m{id: update},
+		}, "u0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Calendar/set response")
+	}
+	if nu, ok := data["notUpdated"].(map[string]any); ok {
+		if errObj, ok := nu[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to update calendar: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "ok", "id": id}, nil
+}
+
+func deleteCalendar(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := calendarAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Calendar/set", m{
+			"accountId": acct,
+			"destroy":   []string{id},
+		}, "d0"},
+	}, calendarCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Calendar/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete calendar: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": id}, nil
+}
+
+// ── Address Book Management Tools ───────────────────────────────────────────
+
+func createAddressBook(params m) (any, error) {
+	name := getString(params, "name")
+	if name == "" {
+		return nil, errInvalidParams("name is required")
+	}
+
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"AddressBook/set", m{
+			"accountId": acct,
+			"create":    m{"ab0": m{"name": name}},
+		}, "c0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected AddressBook/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["ab0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create address book: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created", "name": name}
+	if created, ok := data["created"].(map[string]any); ok {
+		if ab, ok := created["ab0"].(map[string]any); ok {
+			result["id"] = getString(ab, "id")
+		}
+	}
+	return result, nil
+}
+
+func deleteAddressBook(params m) (any, error) {
+	id := getString(params, "id")
+	if id == "" {
+		return nil, errInvalidParams("id is required")
+	}
+
+	acct, err := contactsAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"AddressBook/set", m{
+			"accountId": acct,
+			"destroy":   []string{id},
+		}, "d0"},
+	}, contactsCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected AddressBook/set response")
+	}
+	if nd, ok := data["notDestroyed"].(map[string]any); ok {
+		if errObj, ok := nd[id].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to delete address book: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "deleted", "id": id}, nil
+}
+
+// ── Email Delivery Tracking Tools ───────────────────────────────────────────
+
+func getEmailSubmission(params m) (any, error) {
+	id := getString(params, "id")
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	var calls []any
+	if id != "" {
+		calls = []any{
+			[]any{"EmailSubmission/get", m{
+				"accountId": acct,
+				"ids":       []string{id},
+			}, "s0"},
+		}
+	} else {
+		// List recent submissions
+		limit := intParam(params, "limit", 20, 100)
+		calls = []any{
+			[]any{"EmailSubmission/query", m{
+				"accountId": acct,
+				"sort":      []m{{"property": "sentAt", "isAscending": false}},
+				"limit":     limit,
+			}, "q0"},
+			[]any{"EmailSubmission/get", m{
+				"accountId": acct,
+				"#ids":      m{"resultOf": "q0", "name": "EmailSubmission/query", "path": "/ids"},
+			}, "g0"},
+		}
+	}
+
+	responses, err := jmapCall(calls, submissionCapsGlobal)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the last response (the /get response)
+	getResp := responses[len(responses)-1]
+	list, ok := respList(getResp)
+	if !ok {
+		return nil, errToolError("Unexpected EmailSubmission response")
+	}
+
+	out := make([]m, len(list))
+	for i, sub := range list {
+		entry := m{
+			"id":         getString(sub, "id"),
+			"emailId":    getString(sub, "emailId"),
+			"threadId":   getString(sub, "threadId"),
+			"identityId": getString(sub, "identityId"),
+			"sendAt":     sub["sendAt"],
+			"undoStatus": getString(sub, "undoStatus"),
+		}
+		if ds := getMap(sub, "deliveryStatus"); ds != nil {
+			entry["deliveryStatus"] = ds
+		}
+		if dsn := getSlice(sub, "dsnBlobIds"); len(dsn) > 0 {
+			entry["dsnBlobIds"] = dsn
+		}
+		out[i] = entry
+	}
+
+	if id != "" && len(out) == 1 {
+		return out[0], nil
+	}
+	return m{"submissions": out}, nil
+}
+
+// ── Email Parse Tools ───────────────────────────────────────────────────────
+
+func parseEmail(params m) (any, error) {
+	blobID := getString(params, "blobId")
+	if blobID == "" {
+		return nil, errInvalidParams("blobId is required (upload the .eml file first)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	properties := []string{"id", "from", "to", "cc", "bcc", "replyTo",
+		"subject", "sentAt", "messageId", "inReplyTo", "references",
+		"textBody", "htmlBody", "attachments", "bodyValues", "preview"}
+
+	fetchArgs := m{
+		"accountId":           acct,
+		"blobIds":             []string{blobID},
+		"properties":          properties,
+		"fetchTextBodyValues": true,
+		"fetchHTMLBodyValues": true,
+		"maxBodyValueBytes":   1024 * 1024,
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/parse", fetchArgs, "p0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Email/parse response")
+	}
+
+	if notParsable := getStringSlice(data, "notParsable"); contains(notParsable, blobID) {
+		return nil, errToolError("Blob is not a valid RFC 5322 message: " + blobID)
+	}
+	if notFound := getStringSlice(data, "notFound"); contains(notFound, blobID) {
+		return nil, errInvalidParams("Blob not found: " + blobID)
+	}
+
+	parsed, ok := data["parsed"].(map[string]any)
+	if !ok {
+		return nil, errToolError("Unexpected Email/parse response")
+	}
+
+	email, ok := parsed[blobID].(map[string]any)
+	if !ok {
+		return nil, errToolError("No parsed result for blob")
+	}
+
+	return emailDetailDict(email), nil
+}
+
+// ── MDN (Read Receipt) Tools ────────────────────────────────────────────────
+
+var mdnCaps = []string{
+	"urn:ietf:params:jmap:core",
+	"urn:ietf:params:jmap:mail",
+	"urn:ietf:params:jmap:mdn",
+}
+
+func sendMDN(params m) (any, error) {
+	emailID := getString(params, "forEmailId")
+	if emailID == "" {
+		return nil, errInvalidParams("forEmailId is required (the email to acknowledge)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	mdnObj := m{
+		"forEmailId":             emailID,
+		"disposition":            m{"actionMode": "manual-action", "sendingMode": "mdn-sent-manually", "type": "displayed"},
+		"includeOriginalMessage": false,
+	}
+	if subject := getString(params, "subject"); subject != "" {
+		mdnObj["subject"] = subject
+	}
+	if textBody := getString(params, "textBody"); textBody != "" {
+		mdnObj["textBody"] = textBody
+	}
+
+	// Get the identity for the reportingUA
+	idResponses, err := jmapCall([]any{
+		[]any{"Identity/get", m{"accountId": acct, "properties": []string{"id", "email"}}, "i0"},
+	}, submissionCapsGlobal)
+	if err == nil && len(idResponses) > 0 {
+		if idList, ok := respList(idResponses[0]); ok && len(idList) > 0 {
+			mdnObj["identityId"] = getString(idList[0], "id")
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"MDN/send", m{
+			"accountId": acct,
+			"send":      m{"mdn0": mdnObj},
+		}, "m0"},
+	}, mdnCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected MDN/send response")
+	}
+
+	if ns, ok := data["notSent"].(map[string]any); ok {
+		if errObj, ok := ns["mdn0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to send read receipt: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	return m{"status": "sent", "forEmailId": emailID}, nil
+}
+
+func parseMDN(params m) (any, error) {
+	blobID := getString(params, "blobId")
+	if blobID == "" {
+		return nil, errInvalidParams("blobId is required")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"MDN/parse", m{
+			"accountId": acct,
+			"blobIds":   []string{blobID},
+		}, "p0"},
+	}, mdnCaps)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected MDN/parse response")
+	}
+
+	if notFound := getStringSlice(data, "notFound"); contains(notFound, blobID) {
+		return nil, errInvalidParams("Blob not found: " + blobID)
+	}
+	if notParsable := getStringSlice(data, "notParsable"); contains(notParsable, blobID) {
+		return nil, errToolError("Blob is not a valid MDN: " + blobID)
+	}
+
+	parsed, ok := data["parsed"].(map[string]any)
+	if !ok {
+		return nil, errToolError("Unexpected MDN/parse response")
+	}
+
+	mdn, ok := parsed[blobID].(map[string]any)
+	if !ok {
+		return nil, errToolError("No parsed result for blob")
+	}
+
+	return mdn, nil
+}
+
 // ── Calendar Serialization Helpers ──────────────────────────────────────────
 
 func eventSummaryDict(ev m) m {
@@ -4582,6 +5036,45 @@ var tools = []toolDefinition{
 			"required":   []string{"id"},
 		},
 	},
+	// Calendar Management
+	{
+		Name:        "fm_create_calendar",
+		Description: "Create a new calendar.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"name":      m{"type": "string", "description": "Calendar name"},
+				"color":     m{"type": "string", "description": "CSS color (e.g. #FF5733)"},
+				"isVisible": m{"type": "boolean", "description": "Show in calendar UI (default true)"},
+				"sortOrder": m{"type": "integer", "description": "Display order"},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "fm_update_calendar",
+		Description: "Update a calendar's name, color, or visibility.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":        m{"type": "string", "description": "Calendar ID"},
+				"name":      m{"type": "string", "description": "New name"},
+				"color":     m{"type": "string", "description": "New color"},
+				"isVisible": m{"type": "boolean", "description": "Visibility"},
+				"sortOrder": m{"type": "integer", "description": "Display order"},
+			},
+			"required": []string{"id"},
+		},
+	},
+	{
+		Name:        "fm_delete_calendar",
+		Description: "Delete a calendar and all its events.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Calendar ID"}},
+			"required":   []string{"id"},
+		},
+	},
 	{
 		Name:        "fm_rsvp_event",
 		Description: "Respond to a calendar event invitation (accept, decline, tentative).",
@@ -4738,6 +5231,77 @@ var tools = []toolDefinition{
 		Name:        "fm_list_address_books",
 		Description: "List contact address books.",
 		InputSchema: m{"type": "object", "properties": m{}, "required": []string{}},
+	},
+	{
+		Name:        "fm_create_address_book",
+		Description: "Create a new contact address book.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"name": m{"type": "string", "description": "Address book name"}},
+			"required":   []string{"name"},
+		},
+	},
+	{
+		Name:        "fm_delete_address_book",
+		Description: "Delete a contact address book and all contacts in it.",
+		InputSchema: m{
+			"type":       "object",
+			"properties": m{"id": m{"type": "string", "description": "Address book ID"}},
+			"required":   []string{"id"},
+		},
+	},
+
+	// Email Delivery Tracking
+	{
+		Name:        "fm_get_email_submission",
+		Description: "Check delivery status of sent emails. Pass an ID for a specific submission, or omit to list recent submissions.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"id":    m{"type": "string", "description": "Submission ID (omit to list recent)"},
+				"limit": m{"type": "integer", "description": "Max results when listing (default 20, max 100)"},
+			},
+			"required": []string{},
+		},
+	},
+
+	// Email Parse
+	{
+		Name:        "fm_parse_email",
+		Description: "Parse an uploaded .eml blob into structured email fields (from, to, subject, body, attachments) without importing it into a mailbox.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"blobId": m{"type": "string", "description": "Blob ID of the uploaded RFC 5322 .eml file"},
+			},
+			"required": []string{"blobId"},
+		},
+	},
+
+	// MDN (Read Receipts)
+	{
+		Name:        "fm_send_read_receipt",
+		Description: "Send a read receipt (MDN) acknowledging that an email was read.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"forEmailId": m{"type": "string", "description": "Email ID to acknowledge"},
+				"subject":    m{"type": "string", "description": "Custom subject for the receipt (optional)"},
+				"textBody":   m{"type": "string", "description": "Custom body text (optional)"},
+			},
+			"required": []string{"forEmailId"},
+		},
+	},
+	{
+		Name:        "fm_parse_read_receipt",
+		Description: "Parse a received read receipt (MDN) to extract disposition and original message info.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"blobId": m{"type": "string", "description": "Blob ID of the MDN email"},
+			},
+			"required": []string{"blobId"},
+		},
 	},
 
 	// Email Import
@@ -5003,6 +5567,20 @@ var toolHandlers = map[string]toolFunc{
 	"fm_get_quota":            getQuota,
 	// Attachment
 	"fm_download_attachment":  downloadAttachment,
+	// Calendar Management
+	"fm_create_calendar":      createCalendar,
+	"fm_update_calendar":      updateCalendar,
+	"fm_delete_calendar":      deleteCalendar,
+	// Address Book Management
+	"fm_create_address_book":  createAddressBook,
+	"fm_delete_address_book":  deleteAddressBook,
+	// Delivery Tracking
+	"fm_get_email_submission": getEmailSubmission,
+	// Email Parse
+	"fm_parse_email":          parseEmail,
+	// MDN
+	"fm_send_read_receipt":    sendMDN,
+	"fm_parse_read_receipt":   parseMDN,
 	// Import
 	"fm_import_email":         importEmail,
 	// Agentic Workflow
@@ -5086,7 +5664,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "2.2.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": "3.0.0"},
 		})
 
 	case "notifications/initialized":

@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (56 total)
+## Tools (65 total, covering 35 JMAP methods)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -70,8 +70,11 @@ All JMAP calls follow this pattern:
 - `fm_list_bridge_messages` — unread emails in Bridge mailbox with parsed structured types
 - `fm_ack_bridge_message` — mark read + move to Bridge/Processed
 
-### Calendar (7)
+### Calendar (10)
 - `fm_list_calendars` — all calendars with name, color, visibility
+- `fm_create_calendar` — create calendar; params: name, color, isVisible
+- `fm_update_calendar` — update calendar; params: id, name, color, isVisible
+- `fm_delete_calendar` — delete calendar and all events; params: id
 - `fm_list_events` — events in date range; params: after, before, calendarId, limit
 - `fm_get_event` — full event detail (participants, recurrence, alerts, locations)
 - `fm_create_event` — create event; params: calendarId, title, start, timeZone, duration, etc.
@@ -86,8 +89,10 @@ All JMAP calls follow this pattern:
 - `fm_update_contact` — update contact fields; params: id + any fields
 - `fm_delete_contact` — delete contact; params: id
 
-### Address Books (1)
+### Address Books (3)
 - `fm_list_address_books` — list contact address books
+- `fm_create_address_book` — create address book; params: name
+- `fm_delete_address_book` — delete address book; params: id
 
 ### Identity (2)
 - `fm_list_identities` — sending identities (email addresses)
@@ -134,6 +139,16 @@ All JMAP calls follow this pattern:
 - `fm_activate_sieve_script` — activate a script by ID, or deactivate all (omit id)
 - `fm_validate_sieve_script` — validate syntax without saving; params: content
 
+### Delivery Tracking (1)
+- `fm_get_email_submission` — check delivery status of sent emails; params: id (or list recent)
+
+### Email Parse (1)
+- `fm_parse_email` — parse an uploaded .eml blob into structured fields without importing
+
+### Read Receipts / MDN (2)
+- `fm_send_read_receipt` — send read receipt for an email; params: forEmailId
+- `fm_parse_read_receipt` — parse a received read receipt blob
+
 ### Attachment (1)
 - `fm_download_attachment` — get download URL for attachment; params: blobId, name, type
 
@@ -150,6 +165,7 @@ All JMAP calls follow this pattern:
 | Calendars | `https://www.fastmail.com/dev/calendars` |
 | Masked Email | `https://www.fastmail.com/dev/maskedemail` |
 | Sieve | `urn:ietf:params:jmap:sieve` (RFC 9661) |
+| MDN | `urn:ietf:params:jmap:mdn` (RFC 9007) |
 
 ## AI Playbooks
 
