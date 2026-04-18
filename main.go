@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -78,7 +79,7 @@ func sessionFor(capabilities []string) (apiURL, accountID string, err error) {
 			return "", "", errToolError("Session discovery failed: " + err.Error())
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 
 		if resp.StatusCode == 401 {
 			return "", "", errAuthError("Invalid FASTMAIL_TOKEN (401 Unauthorized)")
@@ -98,6 +99,10 @@ func sessionFor(capabilities []string) (apiURL, accountID string, err error) {
 
 		if url == "" || accounts == nil || primary == nil {
 			return "", "", errToolError("Session discovery: unexpected response format")
+		}
+		// Validate the API URL is a trusted HTTPS origin
+		if !strings.HasPrefix(url, "https://") {
+			return "", "", errToolError("Session discovery: apiUrl is not HTTPS")
 		}
 
 		cachedSessionAPIURL = url
@@ -179,11 +184,8 @@ func jmapCall(methodCalls []any, caps []string) ([]any, error) {
 		return nil, err
 	}
 	if statusCode != 200 {
-		snippet := string(data)
-		if len(snippet) > 500 {
-			snippet = snippet[:500]
-		}
-		return nil, errToolError(fmt.Sprintf("JMAP call failed: HTTP %d — %s", statusCode, snippet))
+		// Only include status code in error — avoid leaking response body content
+		return nil, errToolError(fmt.Sprintf("JMAP call failed: HTTP %d", statusCode))
 	}
 
 	var result map[string]any
@@ -231,7 +233,7 @@ func doHTTPWithRetry(req *http.Request, maxRetries int) ([]byte, int, error) {
 		if err != nil {
 			return nil, 0, errToolError("HTTP request failed: " + err.Error())
 		}
-		data, _ := io.ReadAll(resp.Body)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		resp.Body.Close()
 
 		if resp.StatusCode == 429 && attempt < maxRetries {
@@ -307,6 +309,7 @@ var submissionCapsGlobal = []string{
 }
 
 // blobDownloadURL builds the download URL for a blob.
+// Name and type are URL-encoded to prevent URL structure manipulation.
 func blobDownloadURL(accountID, blobID, name, mimeType string) string {
 	sessionMu.Lock()
 	tpl := cachedDownloadURL
@@ -315,10 +318,10 @@ func blobDownloadURL(accountID, blobID, name, mimeType string) string {
 		return ""
 	}
 	r := strings.NewReplacer(
-		"{accountId}", accountID,
-		"{blobId}", blobID,
-		"{name}", name,
-		"{type}", mimeType,
+		"{accountId}", url.PathEscape(accountID),
+		"{blobId}", url.PathEscape(blobID),
+		"{name}", url.PathEscape(name),
+		"{type}", url.QueryEscape(mimeType),
 	)
 	return r.Replace(tpl)
 }
@@ -532,6 +535,7 @@ func getEmail(params m) (any, error) {
 				"bodyValues", "messageId", "inReplyTo", "references"},
 			"fetchTextBodyValues": true,
 			"fetchHTMLBodyValues": true,
+			"maxBodyValueBytes":   1024 * 1024, // 1MB cap per body part
 		}, "g0"},
 	}, nil)
 	if err != nil {
@@ -569,10 +573,13 @@ func searchEmails(params m) (any, error) {
 		return nil, err
 	}
 
-	// Try to parse query as JSON filter, fall back to text filter
+	// Try to parse query as JSON filter, fall back to text filter.
+	// Allowlist filter keys to prevent injection of arbitrary JMAP filter operators.
 	var filter m
 	if err := json.Unmarshal([]byte(query), &filter); err != nil {
 		filter = m{"text": query}
+	} else {
+		filter = sanitizeEmailFilter(filter)
 	}
 
 	if mailboxID != "" {
@@ -1042,6 +1049,7 @@ func listBridgeMessages(params m) (any, error) {
 			"properties": []string{"id", "threadId", "from", "subject", "receivedAt",
 				"textBody", "bodyValues", "preview"},
 			"fetchTextBodyValues": true,
+			"maxBodyValueBytes":   256 * 1024, // 256KB cap for bridge messages
 		}, "g0"},
 	}, nil)
 	if err != nil {
@@ -1546,11 +1554,40 @@ func intParam(params m, key string, defaultVal, maxVal int) int {
 	if f, ok := params[key].(float64); ok {
 		v = int(f)
 	}
+	if v < 0 {
+		v = 0
+	}
 	if maxVal > 0 && v > maxVal {
 		v = maxVal
 	}
 	return v
 }
+
+// allowedFilterKeys are the safe JMAP Email/query filter keys that callers may use.
+var allowedFilterKeys = map[string]bool{
+	"text": true, "from": true, "to": true, "cc": true, "bcc": true,
+	"subject": true, "body": true, "after": true, "before": true,
+	"minSize": true, "maxSize": true, "hasAttachment": true,
+	"hasKeyword": true, "notKeyword": true, "header": true,
+	"inMailbox": true, "inMailboxOtherThan": true,
+}
+
+// sanitizeEmailFilter strips any keys not in the allowlist to prevent filter injection.
+func sanitizeEmailFilter(f m) m {
+	out := m{}
+	for k, v := range f {
+		if allowedFilterKeys[k] {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return m{"text": ""}
+	}
+	return out
+}
+
+// validKeywordRe matches RFC 8621 keyword characters: letters, digits, $, _, -.
+var validKeywordRe = regexp.MustCompile(`^[A-Za-z0-9\$_-]+$`)
 
 func contains(ss []string, s string) bool {
 	for _, x := range ss {
@@ -1612,6 +1649,10 @@ func getThread(params m) (any, error) {
 	if len(threadEmailIDs) == 0 {
 		return nil, errToolError("Thread has no emails")
 	}
+	// Cap thread size to prevent unbounded memory usage
+	if len(threadEmailIDs) > 100 {
+		threadEmailIDs = threadEmailIDs[len(threadEmailIDs)-100:] // keep most recent 100
+	}
 
 	// Fetch all emails in thread
 	emailResponses, err := jmapCall([]any{
@@ -1622,6 +1663,7 @@ func getThread(params m) (any, error) {
 				"subject", "receivedAt", "preview", "keywords", "size",
 				"textBody", "bodyValues"},
 			"fetchTextBodyValues": true,
+			"maxBodyValueBytes":   256 * 1024, // 256KB cap per body part
 		}, "g0"},
 	}, nil)
 	if err != nil {
@@ -2163,8 +2205,11 @@ func rsvpEvent(params m) (any, error) {
 		return nil, errInvalidParams("id is required")
 	}
 	status := getString(params, "status")
-	if status == "" {
-		return nil, errInvalidParams("status is required (accepted, declined, tentative, needs-action)")
+	switch status {
+	case "accepted", "declined", "tentative", "needs-action":
+		// valid
+	default:
+		return nil, errInvalidParams("status must be one of: accepted, declined, tentative, needs-action")
 	}
 
 	acct, err := calendarAccountID()
@@ -2211,6 +2256,10 @@ func rsvpEvent(params m) (any, error) {
 	}
 	if participantID == "" {
 		return nil, errToolError("Could not find matching participant")
+	}
+	// Reject participant IDs containing '/' to prevent JMAP patch path traversal
+	if strings.Contains(participantID, "/") {
+		return nil, errToolError("Participant ID contains invalid characters")
 	}
 
 	update := m{
@@ -2439,6 +2488,9 @@ func flagEmail(params m) (any, error) {
 	keyword := getString(params, "keyword")
 	if keyword == "" {
 		keyword = "$flagged"
+	}
+	if !validKeywordRe.MatchString(keyword) {
+		return nil, errInvalidParams("keyword contains invalid characters (must be letters, digits, $, _, -)")
 	}
 	set := true
 	if v, ok := params["set"].(bool); ok {
@@ -3547,6 +3599,7 @@ func callTool(name string, arguments m) (any, error) {
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const maxInputBytes = 10 * 1024 * 1024
+const maxResponseBytes = 50 * 1024 * 1024 // 50MB cap on JMAP response reads
 
 func run() {
 	scanner := bufio.NewScanner(os.Stdin)
