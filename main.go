@@ -386,6 +386,7 @@ func uploadBlob(accountID, content, contentType string) (string, error) {
 }
 
 // downloadBlobText downloads a blob and returns its content as a string.
+// Capped at 1MB to prevent abuse with large non-text blobs.
 func downloadBlobText(accountID, blobID string) (string, error) {
 	dlURL := blobDownloadURL(accountID, blobID, "script.sieve", "application/sieve")
 	if dlURL == "" {
@@ -406,6 +407,9 @@ func downloadBlobText(accountID, blobID string) (string, error) {
 	}
 	if statusCode != 200 {
 		return "", errToolError(fmt.Sprintf("Blob download failed: HTTP %d", statusCode))
+	}
+	if len(data) > 1024*1024 {
+		return "", errToolError(fmt.Sprintf("Blob too large for text download (%d bytes, max 1MB)", len(data)))
 	}
 	return string(data), nil
 }
@@ -964,9 +968,9 @@ func sendEmail(params m) (any, error) {
 }
 
 func markRead(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 	read := true
 	if v, ok := params["read"].(bool); ok {
@@ -1006,9 +1010,9 @@ func markRead(params m) (any, error) {
 }
 
 func moveEmail(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 	mailboxID := getString(params, "mailboxId")
 	if mailboxID == "" {
@@ -1044,9 +1048,9 @@ func moveEmail(params m) (any, error) {
 }
 
 func deleteEmail(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -1656,8 +1660,8 @@ func intParam(params m, key string, defaultVal, maxVal int) int {
 	if f, ok := params[key].(float64); ok {
 		v = int(f)
 	}
-	if v < 0 {
-		v = 0
+	if v < 1 {
+		v = 1
 	}
 	if maxVal > 0 && v > maxVal {
 		v = maxVal
@@ -1690,6 +1694,18 @@ func sanitizeEmailFilter(f m) m {
 
 // validKeywordRe matches RFC 8621 keyword characters: letters, digits, $, _, -.
 var validKeywordRe = regexp.MustCompile(`^[A-Za-z0-9\$_-]+$`)
+
+// requireIDs extracts and validates an "ids" string slice from params.
+func requireIDs(params m, maxCount int) ([]string, error) {
+	ids := getStringSlice(params, "ids")
+	if len(ids) == 0 {
+		return nil, errInvalidParams("ids is required (array of email IDs)")
+	}
+	if maxCount > 0 && len(ids) > maxCount {
+		return nil, errInvalidParams(fmt.Sprintf("Too many IDs (%d). Maximum %d per call.", len(ids), maxCount))
+	}
+	return ids, nil
+}
 
 func contains(ss []string, s string) bool {
 	for _, x := range ss {
@@ -1786,12 +1802,9 @@ func listEmailIDs(params m) (any, error) {
 
 // fm_batch_get_emails: fetch multiple emails by ID with bodies in one call.
 func batchGetEmails(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
-	}
-	if len(ids) > 50 {
-		return nil, errInvalidParams("Maximum 50 emails per batch")
+	ids, err := requireIDs(params, 50)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -3112,9 +3125,9 @@ func snoozeEmail(params m) (any, error) {
 }
 
 func flagEmail(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 	keyword := getString(params, "keyword")
 	if keyword == "" {
@@ -3164,9 +3177,9 @@ func flagEmail(params m) (any, error) {
 
 // reportSpam moves emails to Junk and sets $junk keyword to train Fastmail's spam filter.
 func reportSpam(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -3209,9 +3222,9 @@ func reportSpam(params m) (any, error) {
 
 // reportPhishing moves emails to Junk and sets $phishing keyword.
 func reportPhishing(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -3254,9 +3267,9 @@ func reportPhishing(params m) (any, error) {
 
 // reportNotSpam moves emails out of Junk, removes $junk, sets $notjunk.
 func reportNotSpam(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -3306,9 +3319,9 @@ func reportNotSpam(params m) (any, error) {
 
 // archiveEmail moves emails to the Archive mailbox.
 func archiveEmail(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, maxBatchIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -3346,9 +3359,9 @@ func archiveEmail(params m) (any, error) {
 
 // destroyEmail permanently deletes emails (bypasses Trash).
 func destroyEmail(params m) (any, error) {
-	ids := getStringSlice(params, "ids")
-	if len(ids) == 0 {
-		return nil, errInvalidParams("ids is required (array of email IDs)")
+	ids, err := requireIDs(params, 100) // lower cap for irreversible operation
+	if err != nil {
+		return nil, err
 	}
 
 	acct, err := mailAccountID()
@@ -4073,26 +4086,32 @@ func deleteSieveScript(params m) (any, error) {
 		return nil, err
 	}
 
-	// Deactivate first (can't destroy an active script), then destroy
-	setArgs := m{
-		"accountId":                 acct,
-		"onSuccessDeactivateScript": true,
-	}
-
-	responses, err := jmapCall([]any{
-		[]any{"SieveScript/set", setArgs, "deact0"},
+	// Check if this script is active before destroying
+	getResponses, err := jmapCall([]any{
+		[]any{"SieveScript/get", m{
+			"accountId": acct,
+			"ids":       []string{id},
+		}, "g0"},
 	}, sieveCaps)
 	if err != nil {
 		return nil, err
 	}
-	// Ignore deactivation result — may not have been active
+	scriptList := getMapSlice(must(respData(getResponses[0])), "list")
+	if len(scriptList) == 0 {
+		return nil, errInvalidParams("Sieve script not found: " + id)
+	}
 
-	// Now destroy
-	responses, err = jmapCall([]any{
-		[]any{"SieveScript/set", m{
-			"accountId": acct,
-			"destroy":   []string{id},
-		}, "d0"},
+	// Only deactivate if THIS script is the active one
+	destroyArgs := m{
+		"accountId": acct,
+		"destroy":   []string{id},
+	}
+	if getBool(scriptList[0], "isActive") {
+		destroyArgs["onSuccessDeactivateScript"] = true
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"SieveScript/set", destroyArgs, "d0"},
 	}, sieveCaps)
 	if err != nil {
 		return nil, err
@@ -4557,6 +4576,30 @@ func sendMDN(params m) (any, error) {
 	acct, err := mailAccountID()
 	if err != nil {
 		return nil, err
+	}
+
+	// Verify the email actually requested a read receipt
+	checkResponses, err := jmapCall([]any{
+		[]any{"Email/get", m{
+			"accountId":  acct,
+			"ids":        []string{emailID},
+			"properties": []string{"header:Disposition-Notification-To:asAddresses"},
+		}, "chk0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	chkList := getMapSlice(must(respData(checkResponses[0])), "list")
+	if len(chkList) == 0 {
+		return nil, errInvalidParams("Email not found: " + emailID)
+	}
+	// Check if Disposition-Notification-To header exists
+	dntHeader := chkList[0]["header:Disposition-Notification-To:asAddresses"]
+	if dntHeader == nil {
+		return nil, errInvalidParams("Email does not request a read receipt (no Disposition-Notification-To header)")
+	}
+	if arr, ok := dntHeader.([]any); ok && len(arr) == 0 {
+		return nil, errInvalidParams("Email does not request a read receipt (empty Disposition-Notification-To header)")
 	}
 
 	mdnObj := m{
@@ -5618,6 +5661,7 @@ func callTool(name string, arguments m) (any, error) {
 
 const maxInputBytes = 10 * 1024 * 1024
 const maxResponseBytes = 50 * 1024 * 1024 // 50MB cap on JMAP response reads
+const maxBatchIDs = 500                    // cap on IDs per destructive batch (well under JMAP maxObjectsInSet)
 
 func run() {
 	scanner := bufio.NewScanner(os.Stdin)
