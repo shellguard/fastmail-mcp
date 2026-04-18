@@ -1,4 +1,11 @@
+# Swift (legacy)
 .build/
 .swiftpm/
+
+# Go
+fastmail-mcp
+fastmail-mcp.exe
+
+# General
 *.o
 .DS_Store

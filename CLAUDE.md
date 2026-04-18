@@ -2,13 +2,16 @@
 
 ## Project Overview
 
-A single-file Swift MCP server (`Sources/fastmail-mcp/fastmail_mcp.swift`) that exposes Fastmail email, contacts, and identities as MCP tools via the JMAP API. No external dependencies.
+A single-file Go MCP server (`main.go`) that exposes Fastmail email, contacts, and identities as MCP tools via the JMAP API. No external dependencies — stdlib only.
+
+Cross-platform: builds for macOS, Windows, and Linux from a single codebase.
 
 ## Build & Install
 
 ```bash
-swift build -c release        # Binary: .build/release/fastmail-mcp
-./install.sh                  # Build + install to /usr/local/bin + register with Claude Desktop
+go build -o fastmail-mcp .                          # Build for current platform
+GOOS=windows GOARCH=amd64 go build -o fastmail-mcp.exe .  # Cross-compile for Windows
+./install.sh                                         # Build + install + register with Claude Desktop
 ```
 
 ## Configuration
@@ -19,17 +22,19 @@ Required scopes: Mail, Contacts, Submission.
 
 ## Architecture
 
-Single-file Swift, no external dependencies. Uses URLSession + DispatchSemaphore for synchronous JMAP HTTP calls.
+Single-file Go (`main.go`), no external dependencies. Uses `net/http` for synchronous JMAP HTTP calls.
 
 **Logical sections (in order):**
-1. MCP protocol types (`ToolDefinition`, `MCPError`)
-2. JMAP session discovery + HTTP helpers (`sessionFor`, `jmapCall`, `syncHTTP`)
-3. Tool implementations (one Swift function per tool)
-4. Serialization helpers (`emailSummaryDict`, `contactSummaryDict`, etc.)
-5. Tool definitions (`tools` array)
-6. Tool dispatch (`callTool`)
-7. MCP server (`MCPServer` class — JSON-RPC stdio loop)
-8. Entry point
+1. MCP protocol types (`toolDefinition`, `mcpError`)
+2. JMAP session discovery + HTTP helpers (`sessionFor`, `jmapCall`, `doHTTPWithRetry`)
+3. JSON helpers (`getString`, `getMap`, `respData`, `respList`, etc.)
+4. Tool implementations (one Go function per tool)
+5. Serialization helpers (`emailSummaryDict`, `contactSummaryDict`, etc.)
+6. Utility functions (`intParam`, `contains`, `parseBridgeSubject`)
+7. Tool definitions (`tools` slice)
+8. Tool dispatch (`callTool` via `toolHandlers` map)
+9. MCP server (`run`, `handleMessage` — JSON-RPC stdio loop)
+10. Entry point (`main`)
 
 ## JMAP API Pattern
 
@@ -90,16 +95,21 @@ Supported types:
 
 ## Adding a New Tool
 
-1. Add Swift function in the tool implementations section
-2. Add `ToolDefinition` to the `tools` array
-3. Add `case` to `callTool()`
-4. `swift build -c release`
+1. Add a Go function with signature `func myTool(params m) (any, error)` in the tool implementations section
+2. Add a `toolDefinition` to the `tools` slice
+3. Add an entry to the `toolHandlers` map
+4. `go build .`
 
 ## Key Design Notes
 
-- Session is cached for process lifetime (no re-discovery per call)
+- Session is cached for process lifetime (no re-discovery per call), protected by `sync.Mutex`
 - 429 rate limit: retries up to 2 times with `Retry-After` delay (capped at 30s)
 - `fm_send_email` accepts both `[{name, email}]` objects and plain `["email"]` string arrays for to/cc
+- `fm_send_email` moves sent mail to the Sent folder (falls back to destroying draft if no Sent folder)
 - `fm_search_emails` query can be plain text (becomes `{"text": query}`) or a JSON JMAP filter string
 - Contacts use `https://www.fastmail.com/dev/contacts` capability and `ContactCard/query+get`
 - Sending uses `urn:ietf:params:jmap:submission` capability with `Email/set` + `EmailSubmission/set`
+- Limit params are capped at 200 to prevent oversized JMAP responses
+- JSON-RPC notifications (no `id`) never receive responses
+- Proper JSON-RPC error codes: -32600 (invalid request), -32601 (method not found), -32602 (invalid params)
+- Max input line size: 10MB
