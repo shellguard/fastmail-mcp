@@ -1,15 +1,33 @@
 class FastmailMcp < Formula
-  desc "MCP server for Fastmail — email, calendar, contacts, Sieve, and more via JMAP"
+  desc "MCP server for Fastmail — email, contacts, masked email, and more via JMAP"
   homepage "https://github.com/shellguard/fastmail-mcp"
-  url "https://github.com/shellguard/fastmail-mcp/archive/refs/tags/v1.2.0.tar.gz"
-  sha256 "9e3f5c79e331bb2e0d609b90024af4a46b1c3abe33fd60a8dd9d07fb3fda15ba"
+  version "1.2.0"
   license "MIT"
 
-  depends_on "go" => :build
+  on_macos do
+    on_intel do
+      url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.2.0/fastmail-mcp-darwin-amd64.tar.gz"
+      sha256 "1b22f4a03345307e7baabeb1ebd8ad146a84e342e1c02284b839cb88301a3b20"
+    end
+    on_arm do
+      url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.2.0/fastmail-mcp-darwin-arm64.tar.gz"
+      sha256 "9db868f895c1410ca80883bb1528b9d674c84a58c7c64b4fb18dc24c3bd724a8"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.2.0/fastmail-mcp-linux-amd64.tar.gz"
+      sha256 "a1392b89f65cb497c785e9c3b678a9cc3d1a440b052001ea6fe00f89951f0b47"
+    end
+    on_arm do
+      url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.2.0/fastmail-mcp-linux-arm64.tar.gz"
+      sha256 "9e5ce7c65d631ea02c24230d4bf058913c284908d395e7bb986910e1ffad1ccf"
+    end
+  end
 
   def install
-    ldflags = "-s -w -X main.version=#{version}"
-    system "go", "build", *std_go_args(ldflags: ldflags)
+    bin.install "fastmail-mcp"
   end
 
   def caveats
