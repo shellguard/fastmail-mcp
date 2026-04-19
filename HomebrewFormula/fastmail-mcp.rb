@@ -7,22 +7,22 @@ class FastmailMcp < Formula
   on_macos do
     on_intel do
       url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.3.0/fastmail-mcp-darwin-amd64.tar.gz"
-      sha256 "1b22f4a03345307e7baabeb1ebd8ad146a84e342e1c02284b839cb88301a3b20"
+      sha256 "56501ec1a071c97a6f5b5e06c1e6decbc0fe0b9b2cd3ef11964506ddebd44156"
     end
     on_arm do
       url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.3.0/fastmail-mcp-darwin-arm64.tar.gz"
-      sha256 "9db868f895c1410ca80883bb1528b9d674c84a58c7c64b4fb18dc24c3bd724a8"
+      sha256 "e0ca38275276c4cd45b410853b4e365eba620ae33e64896eb099bffd30c1e8e8"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.3.0/fastmail-mcp-linux-amd64.tar.gz"
-      sha256 "a1392b89f65cb497c785e9c3b678a9cc3d1a440b052001ea6fe00f89951f0b47"
+      sha256 "fca7e2cc892e547b11806c55ce4221dec01b43833272a786f0b5a0684182e007"
     end
     on_arm do
       url "https://github.com/shellguard/fastmail-mcp/releases/download/v1.3.0/fastmail-mcp-linux-arm64.tar.gz"
-      sha256 "9e5ce7c65d631ea02c24230d4bf058913c284908d395e7bb986910e1ffad1ccf"
+      sha256 "3f137f2c6fa4b3621825449fac0719679875241faf4894b9f43dbe2dc03a89ad"
     end
   end
 
