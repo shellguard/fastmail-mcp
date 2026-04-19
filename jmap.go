@@ -83,10 +83,10 @@ func sessionFor(capabilities []string) (apiURL, accountID string, err error) {
 		}
 
 		cachedSessionAPIURL = url
-		if dl, _ := session["downloadUrl"].(string); dl != "" {
+		if dl, _ := session["downloadUrl"].(string); dl != "" && strings.HasPrefix(dl, "https://") {
 			cachedDownloadURL = dl
 		}
-		if ul, _ := session["uploadUrl"].(string); ul != "" {
+		if ul, _ := session["uploadUrl"].(string); ul != "" && strings.HasPrefix(ul, "https://") {
 			cachedUploadURL = ul
 		}
 		// Cache all capabilities the server advertises (both keys and full objects)
