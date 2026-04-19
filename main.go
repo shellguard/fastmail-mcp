@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// version is set at build time via -ldflags "-X main.version=..."
+var version = "dev"
+
 // ── MCP Protocol Types ──────────────────────────────────────────────────────
 
 type toolDefinition struct {
@@ -81,7 +84,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "3.1.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": version},
 		})
 
 	case "notifications/initialized":

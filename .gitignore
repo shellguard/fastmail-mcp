@@ -4,6 +4,7 @@ fastmail-mcp.exe
 
 # Build artifacts
 .build/
+dist/
 *.o
 
 # General

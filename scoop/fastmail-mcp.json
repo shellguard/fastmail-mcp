@@ -1,0 +1,39 @@
+{
+  "version": "latest",
+  "description": "MCP server for Fastmail — 72 tools for email, calendar, contacts, Sieve, and more",
+  "homepage": "https://github.com/shellguard/fastmail-mcp",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/shellguard/fastmail-mcp/releases/latest/download/fastmail-mcp-windows-amd64.zip",
+      "bin": "fastmail-mcp.exe"
+    },
+    "arm64": {
+      "url": "https://github.com/shellguard/fastmail-mcp/releases/latest/download/fastmail-mcp-windows-arm64.zip",
+      "bin": "fastmail-mcp.exe"
+    }
+  },
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/shellguard/fastmail-mcp/releases/download/v$version/fastmail-mcp-windows-amd64.zip"
+      },
+      "arm64": {
+        "url": "https://github.com/shellguard/fastmail-mcp/releases/download/v$version/fastmail-mcp-windows-arm64.zip"
+      }
+    }
+  },
+  "notes": [
+    "Set your Fastmail API token:",
+    "  $env:FASTMAIL_TOKEN = 'your-token-here'",
+    "",
+    "Generate a token at:",
+    "  Fastmail > Settings > Privacy & Security > API tokens",
+    "  Required scopes: Mail, Contacts, Calendars, Submission",
+    "",
+    "Register with Claude Desktop:",
+    "  Add to %APPDATA%\\Claude\\claude_desktop_config.json:",
+    "  { \"mcpServers\": { \"fastmail\": { \"command\": \"fastmail-mcp\", \"env\": { \"FASTMAIL_TOKEN\": \"your-token\" } } } }"
+  ]
+}

@@ -9,9 +9,29 @@ Cross-platform: builds for macOS, Windows, and Linux from a single codebase.
 ## Build & Install
 
 ```bash
-go build -o fastmail-mcp .                          # Build for current platform
-GOOS=windows GOARCH=amd64 go build -o fastmail-mcp.exe .  # Cross-compile for Windows
-./install.sh                                         # Build + install + register with Claude Desktop
+make build                # Build for current platform (version injected from git tag)
+make install              # Build + install to PATH + register with Claude Desktop
+make release              # Cross-compile for all 6 platforms (macOS/Linux/Windows × amd64/arm64)
+make checksums            # Generate SHA-256 checksums for release archives
+make vet                  # Run go vet
+make test                 # Run tests
+```
+
+### Package managers
+
+```bash
+# macOS / Linux (Homebrew)
+brew install shellguard/tap/fastmail-mcp
+
+# Windows (Scoop)
+scoop bucket add shellguard https://github.com/shellguard/fastmail-mcp
+scoop install fastmail-mcp
+```
+
+### From source
+
+```bash
+go install github.com/shellguard/fastmail-mcp@latest
 ```
 
 ## Configuration
