@@ -22,20 +22,22 @@ Required scopes: **Mail, Contacts, Calendars, Submission**.
 
 ## Architecture
 
-Single-file Go (`main.go`), no external dependencies. Uses `net/http` for synchronous JMAP HTTP calls.
+Multi-file Go, no external dependencies. Uses `net/http` for synchronous JMAP HTTP calls.
 
-**Logical sections (in order):**
-1. MCP protocol types (`toolDefinition`, `mcpError`)
-2. JMAP session discovery + HTTP helpers (`sessionFor`, `jmapCall`, `doHTTPWithRetry`)
-3. Capability helpers (mail, contacts, calendar, masked email, vacation, quota)
-4. JSON helpers (`getString`, `getMap`, `respData`, `respList`, etc.)
-5. Tool implementations — one Go function per tool, grouped by domain
-6. Serialization helpers (`emailSummaryDict`, `eventSummaryDict`, etc.)
-7. Utility functions (`intParam`, `contains`, `parseBridgeSubject`)
-8. Tool definitions (`tools` slice — 39 total)
-9. Tool dispatch (`callTool` via `toolHandlers` map)
-10. MCP server (`run`, `handleMessage` — JSON-RPC stdio loop)
-11. Entry point (`main`)
+**File structure:**
+| File | Purpose |
+|------|---------|
+| `main.go` | Entry point, MCP server (JSON-RPC stdio loop), error types |
+| `jmap.go` | Session discovery, HTTP helpers, blob upload/download, capability vars |
+| `helpers.go` | JSON helpers, serialization, utilities, filter sanitization |
+| `definitions.go` | All 72 tool definitions + handler dispatch map |
+| `tools_email.go` | Email CRUD, search, thread, batch, import, parse, draft, forward |
+| `tools_mailbox.go` | Mailbox CRUD, bridge inbox |
+| `tools_calendar.go` | Calendar + event CRUD, RSVP |
+| `tools_contacts.go` | Contacts CRUD, address books |
+| `tools_sieve.go` | Sieve script management + capabilities |
+| `tools_workflow.go` | Stats, duplicates, newsletter, sender analysis, follow-up, spam, archive, flag, snooze |
+| `tools_misc.go` | Identity, masked email, vacation, quota, attachment, delivery tracking, MDN |
 
 ## JMAP API Pattern
 
@@ -190,9 +192,9 @@ See **SKILLS.md** for agentic workflow playbooks — step-by-step patterns for i
 
 ## Adding a New Tool
 
-1. Add a Go function with signature `func myTool(params m) (any, error)` in the tool implementations section
-2. Add a `toolDefinition` to the `tools` slice
-3. Add an entry to the `toolHandlers` map
+1. Add a Go function with signature `func myTool(params m) (any, error)` in the appropriate `tools_*.go` file
+2. Add a `toolDefinition` to the `tools` slice in `definitions.go`
+3. Add an entry to the `toolHandlers` map in `definitions.go`
 4. `go build .`
 
 ## Key Design Notes
