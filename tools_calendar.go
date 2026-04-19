@@ -365,13 +365,12 @@ func rsvpEvent(params m) (any, error) {
 	if participantID == "" {
 		return nil, errToolError("Could not find matching participant")
 	}
-	// Reject participant IDs containing '/' to prevent JMAP patch path traversal
-	if strings.Contains(participantID, "/") {
-		return nil, errToolError("Participant ID contains invalid characters")
-	}
+	// JSON Pointer escape (RFC 6901): ~ → ~0, / → ~1
+	escapedID := strings.ReplaceAll(participantID, "~", "~0")
+	escapedID = strings.ReplaceAll(escapedID, "/", "~1")
 
 	update := m{
-		"participants/" + participantID + "/participationStatus": status,
+		"participants/" + escapedID + "/participationStatus": status,
 	}
 
 	responses, err := jmapCall([]any{
