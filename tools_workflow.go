@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -9,6 +10,10 @@ import (
 	"strings"
 	"time"
 )
+
+func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
 
 // isSafeExternalURL validates that a URL points to a public internet host,
 // blocking SSRF to localhost, private networks, link-local, and cloud metadata IPs.
@@ -25,8 +30,11 @@ func isSafeExternalURL(rawURL string) error {
 	if host == "localhost" || host == "" {
 		return fmt.Errorf("localhost URLs are not allowed")
 	}
-	// Resolve and check IP
-	ips, err := net.LookupHost(host)
+	// Resolve with timeout and check IP
+	resolver := &net.Resolver{}
+	ctx, cancel := contextWithTimeout(5 * time.Second)
+	defer cancel()
+	ips, err := resolver.LookupHost(ctx, host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve host %q: %v", host, err)
 	}
@@ -587,12 +595,34 @@ func unsubscribeList(params m) (any, error) {
 	}
 
 	// Check for RFC 8058 one-click support
-	if !strings.Contains(strings.ToLower(unsubPostHeader), "list-unsubscribe=one-click") {
-		return m{
+	// Check for RFC 8058 one-click support (flexible matching)
+	hasOneClick := false
+	postLower := strings.ToLower(strings.TrimSpace(unsubPostHeader))
+	if strings.Contains(postLower, "list-unsubscribe=one-click") || postLower == "one-click" {
+		hasOneClick = true
+	}
+	if !hasOneClick {
+		// Try extracting an HTTPS URL anyway — many senders have List-Unsubscribe
+		// without List-Unsubscribe-Post, meaning the URL is for browser visit, not POST.
+		var fallbackURL string
+		for _, part := range strings.Split(unsubHeader, ",") {
+			part = strings.TrimSpace(part)
+			part = strings.Trim(part, "<>")
+			if strings.HasPrefix(part, "https://") {
+				fallbackURL = part
+				break
+			}
+		}
+		result := m{
 			"status":  "unsupported",
-			"message": "Email does not support RFC 8058 one-click unsubscribe. The List-Unsubscribe header is present but requires manual action (likely a URL to visit). Consider using fm_report_spam instead if this is unwanted mail.",
+			"message": "Email does not support RFC 8058 one-click unsubscribe. Consider using fm_report_spam instead if this is unwanted mail.",
 			"unsubscribeHeader": unsubHeader,
-		}, nil
+		}
+		if fallbackURL != "" {
+			result["unsubscribeUrl"] = fallbackURL
+			result["message"] = "Email does not support RFC 8058 one-click unsubscribe. A manual unsubscribe URL is available (visit in browser). Consider using fm_report_spam instead if this is unwanted mail."
+		}
+		return result, nil
 	}
 
 	// Extract HTTPS URL from List-Unsubscribe header
