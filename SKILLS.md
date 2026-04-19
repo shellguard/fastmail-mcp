@@ -552,6 +552,142 @@ Is the pattern complex?     → Sieve with vnd.cyrus.jmapquery
 
 ---
 
+## Playbook: Newsletter Management
+
+**When the user says:** "Manage my newsletters", "Too many mailing lists", "Unsubscribe from..."
+
+### Step 1: Detect all newsletters
+
+```
+fm_detect_newsletters(mailboxId=inboxId, maxScan=2000)
+→ Returns newsletters sorted by volume:
+  { from, name, count, listId, unsubscribeHeader, canOneClickUnsubscribe, sampleIds }
+```
+
+### Step 2: Categorize with the user
+
+Present the list and ask which category each falls into:
+- **Keep + auto-file** → Sieve rule to fileinto a folder
+- **Keep in inbox** → no action
+- **Legitimate but unwanted** → `fm_unsubscribe_list` (RFC 8058 one-click)
+- **Spam/unwanted** → `fm_report_spam` (never unsubscribe from spam!)
+
+### Step 3: For legitimate unsubscribes
+
+```
+# Only if canOneClickUnsubscribe=true
+fm_unsubscribe_list(emailId=sampleId)
+→ Sends RFC 8058 POST to the sender's unsubscribe endpoint
+```
+
+If `canOneClickUnsubscribe=false`, tell the user they need to visit the URL manually or use `fm_report_spam` if it's unwanted.
+
+### Step 4: For spam newsletters
+
+```
+fm_report_spam(ids=[...all IDs from that sender...])
+→ Trains filter + moves to Junk
+```
+
+### Step 5: Auto-file wanted newsletters with Sieve
+
+```
+fm_set_sieve_script(content="""
+require ["fileinto"];
+if address :contains "from" "newsletter@trusted.com" { fileinto "Newsletters"; stop; }
+if address :contains "from" "digest@service.com" { fileinto "Newsletters"; stop; }
+""", name="newsletter-filing", activate=true)
+```
+
+### Decision tree: Unsubscribe vs Report Spam
+
+```
+Is this a legitimate company you signed up for?
+  AND does canOneClickUnsubscribe=true?
+    → fm_unsubscribe_list (safe RFC 8058 standard)
+  AND canOneClickUnsubscribe=false?
+    → Tell user to visit the unsubscribe URL manually
+
+Is this spam you never signed up for?
+  → fm_report_spam (NEVER unsubscribe — confirms your address)
+
+Is this a legitimate sender but you want to keep receiving?
+  → fm_set_sieve_script to auto-file into a folder
+```
+
+---
+
+## Playbook: Sender Investigation
+
+**When the user says:** "Who is sending me this?", "Is this sender legitimate?", "Should I block this sender?"
+
+```
+fm_analyze_sender(email="sender@example.com")
+→ Returns:
+  - totalEmails, date range (how long they've been emailing)
+  - readCount/unreadCount (does the user engage?)
+  - mailboxes (are they in Inbox? Junk? Archive?)
+  - isMailingList (has List-Id/List-Unsubscribe headers)
+  - authenticationResults (SPF/DKIM pass/fail — spam indicator)
+  - topSubjects (subject patterns)
+```
+
+Based on results:
+- **High volume, never read, no List-Id** → spam → `fm_report_spam`
+- **Has List-Id, user reads some** → wanted newsletter → Sieve auto-file
+- **Has List-Id, user never reads** → unwanted → `fm_unsubscribe_list` or `fm_report_spam`
+- **Low volume, always read** → important sender → no action
+- **Authentication failures** → phishing risk → `fm_report_phishing`
+
+---
+
+## Playbook: Draft Management
+
+**When the user says:** "Save this as a draft", "Show my drafts", "I'll finish this later"
+
+### Save a draft
+
+```
+fm_create_draft(to=["recipient@example.com"], subject="Meeting notes", body="Draft content...")
+→ Returns draft ID
+```
+
+### List and review drafts
+
+```
+fm_list_drafts(limit=20)
+→ Returns drafts with preview text
+```
+
+### To send a draft, use fm_send_email with the same content (JMAP doesn't have a "send draft" method — you create a new submission).
+
+---
+
+## Playbook: Email Forwarding
+
+**When the user says:** "Forward this to...", "Send this email to someone else"
+
+```
+fm_forward_email(emailId="...", to=["colleague@company.com"], comment="FYI — see below")
+→ Sends with "Fwd: <original subject>" and includes original headers + body
+```
+
+---
+
+## Playbook: Follow-up Tracking
+
+**When the user says:** "What emails haven't been replied to?", "Who owes me a response?"
+
+```
+fm_find_unreplied(daysOld=7)
+→ Returns sent emails from the last 7 days where the thread has no reply:
+  { to, subject, sentAt, daysSince }
+```
+
+Present as a follow-up list: "These 5 emails from the past week haven't received replies..."
+
+---
+
 ## Rate Limiting Notes
 
 - Fastmail's JMAP API has rate limits. The MCP server auto-retries on HTTP 429 (up to 2 retries with Retry-After).

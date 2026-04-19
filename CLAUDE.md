@@ -45,7 +45,7 @@ All JMAP calls follow this pattern:
 3. For listing: two-step `Foo/query` → `Foo/get` using back-references (`#ids`)
 4. Rate limiting: automatic retry on 429 with `Retry-After` header
 
-## Tools (65 total, covering 35 JMAP methods)
+## Tools (72 total, covering 35 JMAP methods)
 
 ### Email (9)
 - `fm_list_mailboxes` — all mailboxes with role, unread/total counts
@@ -123,6 +123,23 @@ All JMAP calls follow this pattern:
 
 ### Quota (1)
 - `fm_get_quota` — storage usage and limits
+
+### Newsletter / Mailing List (2)
+- `fm_detect_newsletters` — scan mailbox for List-Id/List-Unsubscribe headers, aggregate by list
+- `fm_unsubscribe_list` — RFC 8058 one-click unsubscribe for TRUSTED senders (not for spam!)
+
+### Draft Management (2)
+- `fm_create_draft` — save email as draft without sending
+- `fm_list_drafts` — list saved drafts
+
+### Forwarding (1)
+- `fm_forward_email` — forward an email with optional comment; params: emailId, to, comment
+
+### Follow-up (1)
+- `fm_find_unreplied` — find sent emails with no reply; params: daysOld, maxScan
+
+### Sender Analysis (1)
+- `fm_analyze_sender` — full sender profile: email count, date range, mailbox distribution, list headers, auth results, top subjects
 
 ### Agentic Workflow (5)
 - `fm_list_email_ids` — lightweight scan: IDs + from + subject + date only (up to 1000/call)

@@ -3902,6 +3902,829 @@ func importEmail(params m) (any, error) {
 	return result, nil
 }
 
+// ── Newsletter / Mailing List Tools ─────────────────────────────────────────
+
+// fm_detect_newsletters scans a mailbox for emails with List-Id/List-Unsubscribe headers
+// and aggregates by mailing list.
+func detectNewsletters(params m) (any, error) {
+	mailboxID := getString(params, "mailboxId")
+	if mailboxID == "" {
+		return nil, errInvalidParams("mailboxId is required")
+	}
+	maxScan := intParam(params, "maxScan", 500, 2000)
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	filter := m{"inMailbox": mailboxID}
+
+	type listInfo struct {
+		ListID       string
+		Name         string
+		From         string
+		FromName     string
+		Unsubscribe  string
+		UnsubPost    bool // has List-Unsubscribe-Post (RFC 8058 one-click)
+		Count        int
+		FirstSeen    string
+		LastSeen     string
+		SampleIDs    []string
+	}
+	lists := map[string]*listInfo{} // key by listId or from-address
+
+	scanned := 0
+	for scanned < maxScan {
+		batchSize := maxScan - scanned
+		if batchSize > 200 {
+			batchSize = 200
+		}
+
+		responses, err := jmapCall([]any{
+			[]any{"Email/query", m{
+				"accountId":       acct,
+				"filter":          filter,
+				"sort":            []m{{"property": "receivedAt", "isAscending": false}},
+				"position":        scanned,
+				"limit":           batchSize,
+				"collapseThreads": false,
+			}, "q0"},
+			[]any{"Email/get", m{
+				"accountId": acct,
+				"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+				"properties": []string{"id", "from", "subject", "receivedAt",
+					"header:List-Id:asText",
+					"header:List-Unsubscribe:asText",
+					"header:List-Unsubscribe-Post:asText"},
+			}, "g0"},
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(responses) < 2 {
+			break
+		}
+
+		emails, ok := respList(responses[1])
+		if !ok || len(emails) == 0 {
+			break
+		}
+
+		for _, e := range emails {
+			listID, _ := e["header:List-Id:asText"].(string)
+			unsubscribe, _ := e["header:List-Unsubscribe:asText"].(string)
+			unsubPost, _ := e["header:List-Unsubscribe-Post:asText"].(string)
+
+			// Only process emails that have mailing list headers
+			if listID == "" && unsubscribe == "" {
+				continue
+			}
+
+			from := ""
+			fromName := ""
+			if addrs := getMapSlice(e, "from"); len(addrs) > 0 {
+				from = strings.ToLower(getString(addrs[0], "email"))
+				fromName = getString(addrs[0], "name")
+			}
+
+			// Key by List-Id if available, else by from address
+			key := listID
+			if key == "" {
+				key = "from:" + from
+			}
+
+			date := getString(e, "receivedAt")
+			emailID := getString(e, "id")
+
+			if li, ok := lists[key]; ok {
+				li.Count++
+				if date != "" && date < li.FirstSeen {
+					li.FirstSeen = date
+				}
+				if date != "" && date > li.LastSeen {
+					li.LastSeen = date
+				}
+				if len(li.SampleIDs) < 3 {
+					li.SampleIDs = append(li.SampleIDs, emailID)
+				}
+			} else {
+				lists[key] = &listInfo{
+					ListID:      listID,
+					Name:        fromName,
+					From:        from,
+					FromName:    fromName,
+					Unsubscribe: unsubscribe,
+					UnsubPost:   strings.Contains(strings.ToLower(unsubPost), "list-unsubscribe=one-click"),
+					Count:       1,
+					FirstSeen:   date,
+					LastSeen:    date,
+					SampleIDs:   []string{emailID},
+				}
+			}
+		}
+
+		scanned += len(emails)
+		if len(emails) < batchSize {
+			break
+		}
+	}
+
+	// Sort by count descending
+	type listEntry struct {
+		Key  string
+		Info *listInfo
+	}
+	sorted := make([]listEntry, 0, len(lists))
+	for k, v := range lists {
+		sorted = append(sorted, listEntry{k, v})
+	}
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].Info.Count > sorted[j-1].Info.Count; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+
+	out := make([]m, 0, len(sorted))
+	for _, entry := range sorted {
+		li := entry.Info
+		d := m{
+			"from":      li.From,
+			"name":      li.Name,
+			"count":     li.Count,
+			"firstSeen": li.FirstSeen,
+			"lastSeen":  li.LastSeen,
+			"sampleIds": li.SampleIDs,
+		}
+		if li.ListID != "" {
+			d["listId"] = li.ListID
+		}
+		if li.Unsubscribe != "" {
+			d["unsubscribeHeader"] = li.Unsubscribe
+			d["canOneClickUnsubscribe"] = li.UnsubPost
+		}
+		out = append(out, d)
+	}
+
+	return m{
+		"mailboxId":   mailboxID,
+		"scanned":     scanned,
+		"listsFound":  len(out),
+		"newsletters": out,
+	}, nil
+}
+
+// fm_unsubscribe_list performs RFC 8058 one-click List-Unsubscribe-Post for TRUSTED senders.
+func unsubscribeList(params m) (any, error) {
+	emailID := getString(params, "emailId")
+	if emailID == "" {
+		return nil, errInvalidParams("emailId is required (an email from the list to unsubscribe from)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch the unsubscribe headers
+	responses, err := jmapCall([]any{
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"ids":       []string{emailID},
+			"properties": []string{"from",
+				"header:List-Unsubscribe:asText",
+				"header:List-Unsubscribe-Post:asText"},
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	list := getMapSlice(must(respData(responses[0])), "list")
+	if len(list) == 0 {
+		return nil, errInvalidParams("Email not found: " + emailID)
+	}
+	email := list[0]
+
+	unsubHeader, _ := email["header:List-Unsubscribe:asText"].(string)
+	unsubPostHeader, _ := email["header:List-Unsubscribe-Post:asText"].(string)
+
+	if unsubHeader == "" {
+		return nil, errInvalidParams("Email has no List-Unsubscribe header — cannot unsubscribe via standard mechanism")
+	}
+
+	// Check for RFC 8058 one-click support
+	if !strings.Contains(strings.ToLower(unsubPostHeader), "list-unsubscribe=one-click") {
+		return m{
+			"status":  "unsupported",
+			"message": "Email does not support RFC 8058 one-click unsubscribe. The List-Unsubscribe header is present but requires manual action (likely a URL to visit). Consider using fm_report_spam instead if this is unwanted mail.",
+			"unsubscribeHeader": unsubHeader,
+		}, nil
+	}
+
+	// Extract HTTPS URL from List-Unsubscribe header
+	// Format: <https://example.com/unsubscribe>, <mailto:unsub@example.com>
+	var unsubURL string
+	for _, part := range strings.Split(unsubHeader, ",") {
+		part = strings.TrimSpace(part)
+		part = strings.Trim(part, "<>")
+		if strings.HasPrefix(part, "https://") {
+			unsubURL = part
+			break
+		}
+	}
+
+	if unsubURL == "" {
+		return m{
+			"status":  "unsupported",
+			"message": "List-Unsubscribe header has no HTTPS URL — only mailto. Use fm_report_spam for untrusted senders.",
+			"unsubscribeHeader": unsubHeader,
+		}, nil
+	}
+
+	// Perform the RFC 8058 one-click POST
+	req, _ := http.NewRequest("POST", unsubURL, strings.NewReader("List-Unsubscribe=One-Click"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	data, statusCode, err := doHTTPWithRetry(req, 1)
+	if err != nil {
+		return nil, errToolError("Unsubscribe request failed: " + err.Error())
+	}
+
+	result := m{
+		"status":     "sent",
+		"url":        unsubURL,
+		"httpStatus": statusCode,
+	}
+	if statusCode >= 200 && statusCode < 300 {
+		result["message"] = "Unsubscribe request accepted"
+	} else {
+		result["message"] = fmt.Sprintf("Server returned HTTP %d — unsubscribe may not have succeeded", statusCode)
+		if len(data) > 0 && len(data) < 500 {
+			result["response"] = string(data)
+		}
+	}
+	return result, nil
+}
+
+// ── Draft Management Tools ──────────────────────────────────────────────────
+
+func createDraft(params m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Find Drafts mailbox
+	draftsID, err := findMailboxByRole(acct, "drafts")
+	if err != nil {
+		return nil, err
+	}
+
+	// Build email object
+	emailObj := m{
+		"mailboxIds": m{draftsID: true},
+		"keywords":   m{"$seen": true, "$draft": true},
+	}
+
+	if subject := getString(params, "subject"); subject != "" {
+		emailObj["subject"] = subject
+	}
+	if body := getString(params, "body"); body != "" {
+		emailObj["textBody"] = []m{{"partId": "body", "type": "text/plain"}}
+		emailObj["bodyValues"] = m{"body": m{"value": body, "isEncodingProblem": false, "isTruncated": false}}
+	}
+
+	// To
+	if toArr := getMapSlice(params, "to"); len(toArr) > 0 {
+		toAny := make([]any, len(toArr))
+		for i, t := range toArr {
+			toAny[i] = t
+		}
+		emailObj["to"] = toAny
+	} else if toStrs := getStringSlice(params, "to"); len(toStrs) > 0 {
+		toAny := make([]any, len(toStrs))
+		for i, s := range toStrs {
+			toAny[i] = m{"email": s}
+		}
+		emailObj["to"] = toAny
+	}
+
+	// Cc
+	if ccArr := getMapSlice(params, "cc"); len(ccArr) > 0 {
+		ccAny := make([]any, len(ccArr))
+		for i, c := range ccArr {
+			ccAny[i] = c
+		}
+		emailObj["cc"] = ccAny
+	} else if ccStrs := getStringSlice(params, "cc"); len(ccStrs) > 0 {
+		ccAny := make([]any, len(ccStrs))
+		for i, s := range ccStrs {
+			ccAny[i] = m{"email": s}
+		}
+		emailObj["cc"] = ccAny
+	}
+
+	// From identity
+	idResponses, err := jmapCall([]any{
+		[]any{"Identity/get", m{"accountId": acct, "properties": []string{"id", "name", "email"}}, "i0"},
+	}, submissionCapsGlobal)
+	if err == nil && len(idResponses) > 0 {
+		if idList, ok := respList(idResponses[0]); ok && len(idList) > 0 {
+			emailObj["from"] = []any{m{
+				"name":  getString(idList[0], "name"),
+				"email": getString(idList[0], "email"),
+			}}
+		}
+	}
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/set", m{
+			"accountId": acct,
+			"create":    m{"draft0": emailObj},
+		}, "c0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, ok := respData(responses[0])
+	if !ok {
+		return nil, errToolError("Unexpected Email/set response")
+	}
+	if nc, ok := data["notCreated"].(map[string]any); ok {
+		if errObj, ok := nc["draft0"].(map[string]any); ok {
+			return nil, errToolError(fmt.Sprintf("Failed to create draft: %s — %s",
+				getString(errObj, "type"), getString(errObj, "description")))
+		}
+	}
+	result := m{"status": "created"}
+	if created, ok := data["created"].(map[string]any); ok {
+		if d, ok := created["draft0"].(map[string]any); ok {
+			result["id"] = getString(d, "id")
+		}
+	}
+	return result, nil
+}
+
+func listDrafts(params m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	draftsID, err := findMailboxByRole(acct, "drafts")
+	if err != nil {
+		return nil, err
+	}
+
+	limit := intParam(params, "limit", 20, 200)
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/query", m{
+			"accountId":       acct,
+			"filter":          m{"inMailbox": draftsID},
+			"sort":            []m{{"property": "receivedAt", "isAscending": false}},
+			"limit":           limit,
+			"collapseThreads": false,
+		}, "q0"},
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+			"properties": []string{"id", "to", "cc", "subject", "receivedAt", "preview", "size"},
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(responses) < 2 {
+		return nil, errToolError("Unexpected response")
+	}
+	emails, ok := respList(responses[1])
+	if !ok {
+		return nil, errToolError("Unexpected response")
+	}
+
+	out := make([]m, len(emails))
+	for i, e := range emails {
+		out[i] = m{
+			"id":         getString(e, "id"),
+			"to":         formatAddresses(e["to"]),
+			"cc":         formatAddresses(e["cc"]),
+			"subject":    getString(e, "subject"),
+			"receivedAt": getString(e, "receivedAt"),
+			"preview":    getString(e, "preview"),
+			"size":       getFloat(e, "size"),
+		}
+	}
+	return m{"drafts": out, "count": len(out)}, nil
+}
+
+// ── Email Forwarding Tools ──────────────────────────────────────────────────
+
+func forwardEmail(params m) (any, error) {
+	emailID := getString(params, "emailId")
+	if emailID == "" {
+		return nil, errInvalidParams("emailId is required (the email to forward)")
+	}
+	toArr := getMapSlice(params, "to")
+	if len(toArr) == 0 {
+		if toStrs := getStringSlice(params, "to"); len(toStrs) > 0 {
+			adjusted := make(m)
+			for k, v := range params {
+				adjusted[k] = v
+			}
+			toObjs := make([]any, len(toStrs))
+			for i, s := range toStrs {
+				toObjs[i] = m{"email": s}
+			}
+			adjusted["to"] = toObjs
+			return forwardEmail(adjusted)
+		}
+		return nil, errInvalidParams("to is required (recipients to forward to)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch original email
+	origResponses, err := jmapCall([]any{
+		[]any{"Email/get", m{
+			"accountId":           acct,
+			"ids":                 []string{emailID},
+			"properties":          []string{"from", "to", "cc", "subject", "receivedAt", "textBody", "htmlBody", "bodyValues", "attachments"},
+			"fetchTextBodyValues": true,
+			"maxBodyValueBytes":   1024 * 1024,
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	origList := getMapSlice(must(respData(origResponses[0])), "list")
+	if len(origList) == 0 {
+		return nil, errInvalidParams("Email not found: " + emailID)
+	}
+	orig := origList[0]
+
+	// Build forwarded message
+	origSubject := getString(orig, "subject")
+	subject := getString(params, "subject")
+	if subject == "" {
+		subject = "Fwd: " + origSubject
+	}
+
+	origFrom := formatAddresses(orig["from"])
+	origTo := formatAddresses(orig["to"])
+	origDate := getString(orig, "receivedAt")
+	origBody := extractBodyText(orig)
+
+	// Build forward body
+	comment := getString(params, "comment")
+	forwardBody := ""
+	if comment != "" {
+		forwardBody = comment + "\n\n"
+	}
+	forwardBody += "---------- Forwarded message ----------\n"
+	forwardBody += fmt.Sprintf("From: %v\nTo: %v\nDate: %s\nSubject: %s\n\n",
+		origFrom, origTo, origDate, origSubject)
+	forwardBody += origBody
+
+	// Use sendEmail with the constructed forward
+	toAny := make([]any, len(toArr))
+	for i, t := range toArr {
+		toAny[i] = t
+	}
+
+	return sendEmail(m{
+		"to":      toAny,
+		"subject": subject,
+		"body":    forwardBody,
+	})
+}
+
+// ── Follow-up Finder Tools ──────────────────────────────────────────────────
+
+// fm_find_unreplied scans Sent mailbox for emails that haven't received replies.
+func findUnreplied(params m) (any, error) {
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Find Sent mailbox
+	sentID, err := findMailboxByRole(acct, "sent")
+	if err != nil {
+		return nil, err
+	}
+
+	maxScan := intParam(params, "maxScan", 200, 500)
+	daysOld := intParam(params, "daysOld", 3, 90)
+
+	// Calculate the cutoff date
+	cutoff := time.Now().UTC().AddDate(0, 0, -daysOld).Format("2006-01-02T15:04:05Z")
+
+	responses, err := jmapCall([]any{
+		[]any{"Email/query", m{
+			"accountId": acct,
+			"filter":    m{"inMailbox": sentID, "after": cutoff},
+			"sort":      []m{{"property": "receivedAt", "isAscending": false}},
+			"limit":     maxScan,
+		}, "q0"},
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+			"properties": []string{"id", "threadId", "to", "subject", "receivedAt", "messageId"},
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(responses) < 2 {
+		return nil, errToolError("Unexpected response")
+	}
+	sentEmails, ok := respList(responses[1])
+	if !ok {
+		return nil, errToolError("Unexpected response")
+	}
+
+	// For each sent email, check if the thread has a reply (another email from someone else)
+	// Batch thread IDs
+	threadIDs := map[string]bool{}
+	emailsByThread := map[string][]m{}
+	for _, e := range sentEmails {
+		tid := getString(e, "threadId")
+		if tid != "" {
+			threadIDs[tid] = true
+			emailsByThread[tid] = append(emailsByThread[tid], e)
+		}
+	}
+
+	// Fetch threads to get all email IDs
+	threadIDSlice := make([]string, 0, len(threadIDs))
+	for tid := range threadIDs {
+		threadIDSlice = append(threadIDSlice, tid)
+	}
+
+	// Cap thread fetch to prevent excessive calls
+	if len(threadIDSlice) > 100 {
+		threadIDSlice = threadIDSlice[:100]
+	}
+
+	threadResponses, err := jmapCall([]any{
+		[]any{"Thread/get", m{
+			"accountId": acct,
+			"ids":       threadIDSlice,
+		}, "t0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	threadList, _ := respList(threadResponses[0])
+	threadSizes := map[string]int{} // threadId → total emails in thread
+	for _, t := range threadList {
+		tid := getString(t, "id")
+		emailIDs := getStringSlice(t, "emailIds")
+		threadSizes[tid] = len(emailIDs)
+	}
+
+	// Unreplied = sent emails in threads with only 1 email (the sent one itself)
+	unreplied := []m{}
+	for _, e := range sentEmails {
+		tid := getString(e, "threadId")
+		if threadSizes[tid] <= 1 {
+			to := ""
+			if addrs := getMapSlice(e, "to"); len(addrs) > 0 {
+				to = getString(addrs[0], "email")
+				if name := getString(addrs[0], "name"); name != "" {
+					to = name + " <" + to + ">"
+				}
+			}
+			unreplied = append(unreplied, m{
+				"id":         getString(e, "id"),
+				"to":         to,
+				"subject":    getString(e, "subject"),
+				"sentAt":     getString(e, "receivedAt"),
+				"daysSince":  int(time.Since(parseTime(getString(e, "receivedAt"))).Hours() / 24),
+			})
+		}
+	}
+
+	return m{
+		"scanned":   len(sentEmails),
+		"unreplied": unreplied,
+		"count":     len(unreplied),
+		"daysOld":   daysOld,
+	}, nil
+}
+
+// ── Sender Analysis Tools ───────────────────────────────────────────────────
+
+func analyzeSender(params m) (any, error) {
+	sender := getString(params, "email")
+	if sender == "" {
+		return nil, errInvalidParams("email is required (sender email address to analyze)")
+	}
+
+	acct, err := mailAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	maxScan := intParam(params, "maxScan", 200, 500)
+
+	// Search for all emails from this sender
+	responses, err := jmapCall([]any{
+		[]any{"Email/query", m{
+			"accountId":      acct,
+			"filter":         m{"from": sender},
+			"sort":           []m{{"property": "receivedAt", "isAscending": true}},
+			"limit":          maxScan,
+			"calculateTotal": true,
+		}, "q0"},
+		[]any{"Email/get", m{
+			"accountId": acct,
+			"#ids":      m{"resultOf": "q0", "name": "Email/query", "path": "/ids"},
+			"properties": []string{"id", "mailboxIds", "subject", "receivedAt", "keywords", "size",
+				"header:List-Id:asText",
+				"header:List-Unsubscribe:asText",
+				"header:List-Unsubscribe-Post:asText",
+				"header:Authentication-Results:asText"},
+		}, "g0"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(responses) < 2 {
+		return nil, errToolError("Unexpected response")
+	}
+
+	var totalEmails int
+	if qData, ok := respData(responses[0]); ok {
+		if t, ok := qData["total"].(float64); ok {
+			totalEmails = int(t)
+		}
+	}
+
+	emails, ok := respList(responses[1])
+	if !ok {
+		return nil, errToolError("Unexpected response")
+	}
+
+	// Aggregate stats
+	mailboxHits := map[string]int{}
+	var totalSize float64
+	var readCount, unreadCount, flaggedCount int
+	var hasListHeaders bool
+	var listID, unsubscribe string
+	var authResults []string
+	var oldest, newest string
+	subjects := map[string]int{}
+
+	for _, e := range emails {
+		// Mailbox distribution
+		if mbIds := getMap(e, "mailboxIds"); mbIds != nil {
+			for mbId := range mbIds {
+				mailboxHits[mbId]++
+			}
+		}
+
+		// Read/flag status
+		kw := getMap(e, "keywords")
+		if _, seen := kw["$seen"]; seen {
+			readCount++
+		} else {
+			unreadCount++
+		}
+		if _, flagged := kw["$flagged"]; flagged {
+			flaggedCount++
+		}
+
+		// Size
+		totalSize += getFloat(e, "size")
+
+		// Dates
+		date := getString(e, "receivedAt")
+		if date != "" {
+			if oldest == "" || date < oldest {
+				oldest = date
+			}
+			if newest == "" || date > newest {
+				newest = date
+			}
+		}
+
+		// List headers
+		if lid, _ := e["header:List-Id:asText"].(string); lid != "" {
+			hasListHeaders = true
+			listID = lid
+		}
+		if unsub, _ := e["header:List-Unsubscribe:asText"].(string); unsub != "" {
+			unsubscribe = unsub
+		}
+
+		// Auth results (sample first one)
+		if ar, _ := e["header:Authentication-Results:asText"].(string); ar != "" && len(authResults) < 3 {
+			authResults = append(authResults, ar)
+		}
+
+		// Subject patterns (top 10)
+		subj := getString(e, "subject")
+		if subj != "" && len(subjects) < 100 {
+			subjects[subj]++
+		}
+	}
+
+	// Resolve mailbox names
+	mbResponses, err := jmapCall([]any{
+		[]any{"Mailbox/get", m{
+			"accountId":  acct,
+			"properties": []string{"id", "name", "role"},
+		}, "mb0"},
+	}, nil)
+	mbNameMap := map[string]string{}
+	if err == nil && len(mbResponses) > 0 {
+		if mbList, ok := respList(mbResponses[0]); ok {
+			for _, mb := range mbList {
+				mbNameMap[getString(mb, "id")] = getString(mb, "name")
+			}
+		}
+	}
+
+	mailboxDist := []m{}
+	for mbId, count := range mailboxHits {
+		name := mbNameMap[mbId]
+		if name == "" {
+			name = mbId
+		}
+		mailboxDist = append(mailboxDist, m{"mailbox": name, "count": count})
+	}
+
+	// Top subjects
+	type subjEntry struct {
+		Subject string
+		Count   int
+	}
+	topSubjects := make([]subjEntry, 0, len(subjects))
+	for s, c := range subjects {
+		topSubjects = append(topSubjects, subjEntry{s, c})
+	}
+	for i := 1; i < len(topSubjects); i++ {
+		for j := i; j > 0 && topSubjects[j].Count > topSubjects[j-1].Count; j-- {
+			topSubjects[j], topSubjects[j-1] = topSubjects[j-1], topSubjects[j]
+		}
+	}
+	topSubjOut := make([]m, 0, 10)
+	for i, s := range topSubjects {
+		if i >= 10 {
+			break
+		}
+		topSubjOut = append(topSubjOut, m{"subject": s.Subject, "count": s.Count})
+	}
+
+	result := m{
+		"email":          sender,
+		"totalEmails":    totalEmails,
+		"scanned":        len(emails),
+		"readCount":      readCount,
+		"unreadCount":    unreadCount,
+		"flaggedCount":   flaggedCount,
+		"totalSizeBytes": int(totalSize),
+		"oldestEmail":    oldest,
+		"newestEmail":    newest,
+		"mailboxes":      mailboxDist,
+		"topSubjects":    topSubjOut,
+		"isMailingList":  hasListHeaders,
+	}
+
+	if hasListHeaders {
+		result["listId"] = listID
+		result["unsubscribeHeader"] = unsubscribe
+	}
+	if len(authResults) > 0 {
+		result["authenticationResults"] = authResults
+	}
+
+	return result, nil
+}
+
+// parseTime attempts to parse an ISO 8601 datetime, returning zero time on failure.
+func parseTime(s string) time.Time {
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02T15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // ── Sieve Filter Tools ──────────────────────────────────────────────────────
 
 func listSieveScripts(_ m) (any, error) {
@@ -5490,6 +6313,102 @@ var tools = []toolDefinition{
 		},
 	},
 
+	// Newsletter / Mailing List
+	{
+		Name:        "fm_detect_newsletters",
+		Description: "Scan a mailbox for newsletters and mailing lists by detecting List-Id/List-Unsubscribe headers. Returns aggregated list with sender, count, and whether RFC 8058 one-click unsubscribe is supported.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"mailboxId": m{"type": "string", "description": "Mailbox ID to scan"},
+				"maxScan":   m{"type": "integer", "description": "Max emails to scan (default 500, max 2000)"},
+			},
+			"required": []string{"mailboxId"},
+		},
+	},
+	{
+		Name:        "fm_unsubscribe_list",
+		Description: "Unsubscribe from a mailing list using RFC 8058 one-click List-Unsubscribe-Post. Only works with TRUSTED senders that support the standard. For untrusted/spam senders, use fm_report_spam instead — unsubscribing from spam confirms your address is live.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"emailId": m{"type": "string", "description": "An email ID from the list to unsubscribe from"},
+			},
+			"required": []string{"emailId"},
+		},
+	},
+
+	// Draft Management
+	{
+		Name:        "fm_create_draft",
+		Description: "Save an email as a draft without sending. Returns the draft ID for later editing or sending.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"to":      m{"type": "array", "description": "Recipients (optional for drafts)", "items": m{}},
+				"cc":      m{"type": "array", "description": "CC recipients", "items": m{}},
+				"subject": m{"type": "string", "description": "Subject"},
+				"body":    m{"type": "string", "description": "Plain text body"},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "fm_list_drafts",
+		Description: "List saved email drafts.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"limit": m{"type": "integer", "description": "Max drafts to return (default 20, max 200)"},
+			},
+			"required": []string{},
+		},
+	},
+
+	// Email Forwarding
+	{
+		Name:        "fm_forward_email",
+		Description: "Forward an email to new recipients. Includes the original message in the body.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"emailId": m{"type": "string", "description": "Email ID to forward"},
+				"to":      m{"type": "array", "description": "Recipients to forward to", "items": m{}},
+				"comment": m{"type": "string", "description": "Optional message to add above the forwarded content"},
+				"subject": m{"type": "string", "description": "Custom subject (default: 'Fwd: <original subject>')"},
+			},
+			"required": []string{"emailId", "to"},
+		},
+	},
+
+	// Follow-up Finder
+	{
+		Name:        "fm_find_unreplied",
+		Description: "Find sent emails that haven't received a reply. Scans Sent mailbox and checks thread sizes to identify unreplied conversations.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"maxScan": m{"type": "integer", "description": "Max sent emails to scan (default 200, max 500)"},
+				"daysOld": m{"type": "integer", "description": "Only check emails sent within this many days (default 3, max 90)"},
+			},
+			"required": []string{},
+		},
+	},
+
+	// Sender Analysis
+	{
+		Name:        "fm_analyze_sender",
+		Description: "Analyze a sender: email count, date range, mailbox distribution, read/flag rates, mailing list headers, authentication results, and top subjects. Useful for deciding whether to report spam, unsubscribe, or create a Sieve rule.",
+		InputSchema: m{
+			"type": "object",
+			"properties": m{
+				"email":   m{"type": "string", "description": "Sender email address to analyze"},
+				"maxScan": m{"type": "integer", "description": "Max emails to scan (default 200, max 500)"},
+			},
+			"required": []string{"email"},
+		},
+	},
+
 	// Sieve Filter Management
 	{
 		Name:        "fm_list_sieve_scripts",
@@ -5640,6 +6559,18 @@ var toolHandlers = map[string]toolFunc{
 	"fm_archive_email":         archiveEmail,
 	"fm_destroy_email":         destroyEmail,
 	"fm_unsnooze_email":        unsnoozeEmail,
+	// Newsletter / Mailing List
+	"fm_detect_newsletters":   detectNewsletters,
+	"fm_unsubscribe_list":     unsubscribeList,
+	// Draft Management
+	"fm_create_draft":         createDraft,
+	"fm_list_drafts":          listDrafts,
+	// Forwarding
+	"fm_forward_email":        forwardEmail,
+	// Follow-up
+	"fm_find_unreplied":       findUnreplied,
+	// Sender Analysis
+	"fm_analyze_sender":       analyzeSender,
 	// Sieve
 	"fm_list_sieve_scripts":   listSieveScripts,
 	"fm_get_sieve_script":     getSieveScript,
@@ -5708,7 +6639,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 		send(m{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": "3.0.0"},
+			"serverInfo":      m{"name": "fastmail-mcp", "version": "3.1.0"},
 		})
 
 	case "notifications/initialized":
