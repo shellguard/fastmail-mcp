@@ -65,6 +65,9 @@ func getMailboxStats(params m) (any, error) {
 	}
 
 	filter := m{"inMailbox": mailboxID}
+	if after := getString(params, "after"); after != "" {
+		filter["after"] = after
+	}
 	if onlyUnread {
 		filter["notKeyword"] = "$seen"
 	}
@@ -84,7 +87,7 @@ func getMailboxStats(params m) (any, error) {
 			batchSize = 200
 		}
 
-		responses, err := jmapCall([]any{
+		responses, err := jmapCallLong([]any{
 			[]any{"Email/query", m{
 				"accountId":       acct,
 				"filter":          filter,
@@ -247,7 +250,7 @@ func findDuplicates(params m) (any, error) {
 			batchSize = 200
 		}
 
-		responses, err := jmapCall([]any{
+		responses, err := jmapCallLong([]any{
 			[]any{"Email/query", m{
 				"accountId":       acct,
 				"filter":          filter,
@@ -388,6 +391,10 @@ func detectNewsletters(params m) (any, error) {
 	}
 
 	filter := m{"inMailbox": mailboxID}
+	// Optional date filter to narrow scan on large mailboxes
+	if after := getString(params, "after"); after != "" {
+		filter["after"] = after
+	}
 
 	type listInfo struct {
 		ListID       string
@@ -410,7 +417,7 @@ func detectNewsletters(params m) (any, error) {
 			batchSize = 200
 		}
 
-		responses, err := jmapCall([]any{
+		responses, err := jmapCallLong([]any{
 			[]any{"Email/query", m{
 				"accountId":       acct,
 				"filter":          filter,
@@ -553,7 +560,7 @@ func unsubscribeList(params m) (any, error) {
 	}
 
 	// Fetch the unsubscribe headers
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/get", m{
 			"accountId": acct,
 			"ids":       []string{emailID},
@@ -652,7 +659,7 @@ func analyzeSender(params m) (any, error) {
 	maxScan := intParamMin1(params, "maxScan", 200, 500)
 
 	// Search for all emails from this sender
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/query", m{
 			"accountId":      acct,
 			"filter":         m{"from": sender},
@@ -755,7 +762,7 @@ func analyzeSender(params m) (any, error) {
 	}
 
 	// Resolve mailbox names
-	mbResponses, err := jmapCall([]any{
+	mbResponses, err := jmapCallLong([]any{
 		[]any{"Mailbox/get", m{
 			"accountId":  acct,
 			"properties": []string{"id", "name", "role"},
@@ -844,7 +851,7 @@ func findUnreplied(params m) (any, error) {
 	// Calculate the cutoff date
 	cutoff := time.Now().UTC().AddDate(0, 0, -daysOld).Format("2006-01-02T15:04:05Z")
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/query", m{
 			"accountId": acct,
 			"filter":    m{"inMailbox": sentID, "after": cutoff},
@@ -892,7 +899,7 @@ func findUnreplied(params m) (any, error) {
 		threadIDSlice = threadIDSlice[:100]
 	}
 
-	threadResponses, err := jmapCall([]any{
+	threadResponses, err := jmapCallLong([]any{
 		[]any{"Thread/get", m{
 			"accountId": acct,
 			"ids":       threadIDSlice,
@@ -969,7 +976,7 @@ func reportSpam(params m) (any, error) {
 		}
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1014,7 +1021,7 @@ func reportPhishing(params m) (any, error) {
 		}
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1064,7 +1071,7 @@ func reportNotSpam(params m) (any, error) {
 		}
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1106,7 +1113,7 @@ func archiveEmail(params m) (any, error) {
 		update[id] = m{"mailboxIds": m{archiveID: true}}
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1136,7 +1143,7 @@ func destroyEmail(params m) (any, error) {
 		return nil, err
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{
 			"accountId": acct,
 			"destroy":   ids,
@@ -1187,7 +1194,7 @@ func unsnoozeEmail(params m) (any, error) {
 
 	update := m{id: m{"snoozed": nil}}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1222,7 +1229,7 @@ func snoozeEmail(params m) (any, error) {
 	moveToID := getString(params, "mailboxId")
 	if moveToID == "" {
 		// Default to inbox
-		mbResponses, err := jmapCall([]any{
+		mbResponses, err := jmapCallLong([]any{
 			[]any{"Mailbox/query", m{"accountId": acct, "filter": m{"role": "inbox"}}, "mq0"},
 		}, nil)
 		if err == nil && len(mbResponses) > 0 {
@@ -1241,7 +1248,7 @@ func snoozeEmail(params m) (any, error) {
 
 	update := m{id: m{"snoozed": snoozed}}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {
@@ -1286,7 +1293,7 @@ func flagEmail(params m) (any, error) {
 		}
 	}
 
-	responses, err := jmapCall([]any{
+	responses, err := jmapCallLong([]any{
 		[]any{"Email/set", m{"accountId": acct, "update": update}, "u0"},
 	}, nil)
 	if err != nil {

@@ -647,13 +647,14 @@ var tools = []toolDefinition{
 	},
 	{
 		Name:        "fm_get_mailbox_stats",
-		Description: "Aggregate statistics for a mailbox: top senders, top domains, date range, size. Scans up to 1000 emails for a statistical overview — ideal for planning cleanup and Sieve rules.",
+		Description: "Aggregate statistics for a mailbox: top senders, top domains, date range, size. Scans up to 1000 emails for a statistical overview — ideal for planning cleanup and Sieve rules. Use 'after' to limit scan range on large mailboxes.",
 		InputSchema: m{
 			"type": "object",
 			"properties": m{
 				"mailboxId":  m{"type": "string", "description": "Mailbox ID to analyze"},
 				"maxScan":    m{"type": "integer", "description": "Max emails to scan (default 500, max 1000)"},
 				"onlyUnread": m{"type": "boolean", "description": "Only analyze unread emails (default false)"},
+				"after":      m{"type": "string", "description": "Only scan emails after this date (UTC, e.g. 2026-01-01T00:00:00Z). Recommended for large mailboxes."},
 			},
 			"required": []string{"mailboxId"},
 		},
@@ -748,12 +749,13 @@ var tools = []toolDefinition{
 	// Newsletter / Mailing List
 	{
 		Name:        "fm_detect_newsletters",
-		Description: "Scan a mailbox for newsletters and mailing lists by detecting List-Id/List-Unsubscribe headers. Returns aggregated list with sender, count, and whether RFC 8058 one-click unsubscribe is supported.",
+		Description: "Scan a mailbox for newsletters and mailing lists by detecting List-Id/List-Unsubscribe headers. Returns aggregated list with sender, count, and whether RFC 8058 one-click unsubscribe is supported. Use 'after' to limit scan range on large mailboxes.",
 		InputSchema: m{
 			"type": "object",
 			"properties": m{
 				"mailboxId": m{"type": "string", "description": "Mailbox ID to scan"},
 				"maxScan":   m{"type": "integer", "description": "Max emails to scan (default 500, max 2000)"},
+				"after":     m{"type": "string", "description": "Only scan emails after this date (UTC, e.g. 2025-01-01T00:00:00Z). Recommended for large mailboxes."},
 			},
 			"required": []string{"mailboxId"},
 		},

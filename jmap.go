@@ -148,8 +148,17 @@ var defaultCaps = []string{
 	"urn:ietf:params:jmap:mail",
 }
 
+// jmapCallLong is like jmapCall but uses the 90s timeout for large scans.
+func jmapCallLong(methodCalls []any, caps []string) ([]any, error) {
+	return jmapCallUsing(methodCalls, caps, doHTTPWithRetryLong)
+}
+
 // jmapCall makes a JMAP API call and returns the methodResponses array.
 func jmapCall(methodCalls []any, caps []string) ([]any, error) {
+	return jmapCallUsing(methodCalls, caps, doHTTPWithRetry)
+}
+
+func jmapCallUsing(methodCalls []any, caps []string, httpDo func(*http.Request, int) ([]byte, int, error)) ([]any, error) {
 	if caps == nil {
 		caps = defaultCaps
 	}
@@ -175,7 +184,7 @@ func jmapCall(methodCalls []any, caps []string) ([]any, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	data, statusCode, err := doHTTPWithRetry(req, 2)
+	data, statusCode, err := httpDo(req, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -317,14 +326,35 @@ var submissionCapsGlobal = []string{
 	"urn:ietf:params:jmap:submission",
 }
 
-var sieveCaps = []string{
-	"urn:ietf:params:jmap:core",
+// sieveCaps is resolved dynamically — Fastmail may use a vendor URI.
+var sieveCapCandidates = []string{
 	"urn:ietf:params:jmap:sieve",
+	"https://www.fastmail.com/dev/sieve",
 }
 
-func sieveAccountID() (string, error) {
-	_, id, err := sessionFor(sieveCaps)
-	return id, err
+func resolveSieveCaps() ([]string, error) {
+	// Ensure session is loaded
+	_, _, err := sessionFor(defaultCaps)
+	if err != nil {
+		return nil, err
+	}
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	for _, cap := range sieveCapCandidates {
+		if cachedCapabilities[cap] {
+			return []string{"urn:ietf:params:jmap:core", cap}, nil
+		}
+	}
+	return nil, errToolError("Sieve is not supported by this server. Check API token scopes and server capabilities.")
+}
+
+func sieveAccountAndCaps() (string, []string, error) {
+	caps, err := resolveSieveCaps()
+	if err != nil {
+		return "", nil, err
+	}
+	_, id, err := sessionFor(caps)
+	return id, caps, err
 }
 
 // uploadBlob uploads text content as a blob and returns the blobId.

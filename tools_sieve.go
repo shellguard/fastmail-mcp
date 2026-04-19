@@ -5,7 +5,7 @@ import "fmt"
 // ── Sieve Filter Tools ──────────────────────────────────────────────────────
 
 func listSieveScripts(_ m) (any, error) {
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -15,7 +15,7 @@ func listSieveScripts(_ m) (any, error) {
 			"accountId": acct,
 			"ids":       nil, // null = get all
 		}, "s0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func getSieveScript(params m) (any, error) {
 		return nil, errInvalidParams("id is required")
 	}
 
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func getSieveScript(params m) (any, error) {
 			"accountId": acct,
 			"ids":       []string{id},
 		}, "s0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func setSieveScript(params m) (any, error) {
 		return nil, errInvalidParams("content is required (Sieve script source)")
 	}
 
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func setSieveScript(params m) (any, error) {
 
 	responses, err := jmapCall([]any{
 		[]any{"SieveScript/set", setArgs, "c0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +181,7 @@ func deleteSieveScript(params m) (any, error) {
 		return nil, errInvalidParams("id is required")
 	}
 
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +192,7 @@ func deleteSieveScript(params m) (any, error) {
 			"accountId": acct,
 			"ids":       []string{id},
 		}, "g0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +212,7 @@ func deleteSieveScript(params m) (any, error) {
 
 	responses, err := jmapCall([]any{
 		[]any{"SieveScript/set", destroyArgs, "d0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +231,7 @@ func deleteSieveScript(params m) (any, error) {
 }
 
 func activateSieveScript(params m) (any, error) {
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +249,7 @@ func activateSieveScript(params m) (any, error) {
 
 	responses, err := jmapCall([]any{
 		[]any{"SieveScript/set", setArgs, "a0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +276,7 @@ func validateSieveScript(params m) (any, error) {
 		return nil, errInvalidParams("content is required (Sieve script source)")
 	}
 
-	acct, err := sieveAccountID()
+	acct, caps, err := sieveAccountAndCaps()
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +292,7 @@ func validateSieveScript(params m) (any, error) {
 			"accountId": acct,
 			"blobId":    blobID,
 		}, "v0"},
-	}, sieveCaps)
+	}, caps)
 	if err != nil {
 		return nil, err
 	}
@@ -325,39 +325,45 @@ func getSieveCapabilities(_ m) (any, error) {
 	}
 
 	sessionMu.Lock()
-	hasSieve := cachedCapabilities["urn:ietf:params:jmap:sieve"]
-	sieveData := cachedCapabilityData["urn:ietf:params:jmap:sieve"]
-	sessionMu.Unlock()
+	defer sessionMu.Unlock()
 
-	if !hasSieve {
-		return m{
-			"supported":  false,
-			"message":    "urn:ietf:params:jmap:sieve capability not advertised by server",
-		}, nil
-	}
-
-	result := m{"supported": true}
-
-	if sieveData != nil {
-		if exts := getStringSlice(sieveData, "sieveExtensions"); len(exts) > 0 {
-			result["extensions"] = exts
-		}
-		if impl := getString(sieveData, "implementation"); impl != "" {
-			result["implementation"] = impl
-		}
-		if maxSize, ok := sieveData["maxSizeScript"].(float64); ok {
-			result["maxSizeScript"] = int(maxSize)
-		}
-		if maxScripts, ok := sieveData["maxNumberScripts"].(float64); ok {
-			result["maxNumberScripts"] = int(maxScripts)
-		}
-		if maxName, ok := sieveData["maxSizeScriptName"].(float64); ok {
-			result["maxSizeScriptName"] = int(maxName)
-		}
-		if notif := getStringSlice(sieveData, "notificationMethods"); len(notif) > 0 {
-			result["notificationMethods"] = notif
+	// Check all candidate URNs
+	for _, cap := range sieveCapCandidates {
+		if cachedCapabilities[cap] {
+			result := m{"supported": true, "capability": cap}
+			if data := cachedCapabilityData[cap]; data != nil {
+				if exts := getStringSlice(data, "sieveExtensions"); len(exts) > 0 {
+					result["extensions"] = exts
+				}
+				if impl := getString(data, "implementation"); impl != "" {
+					result["implementation"] = impl
+				}
+				if maxSize, ok := data["maxSizeScript"].(float64); ok {
+					result["maxSizeScript"] = int(maxSize)
+				}
+				if maxScripts, ok := data["maxNumberScripts"].(float64); ok {
+					result["maxNumberScripts"] = int(maxScripts)
+				}
+				if maxName, ok := data["maxSizeScriptName"].(float64); ok {
+					result["maxSizeScriptName"] = int(maxName)
+				}
+				if notif := getStringSlice(data, "notificationMethods"); len(notif) > 0 {
+					result["notificationMethods"] = notif
+				}
+			}
+			return result, nil
 		}
 	}
 
-	return result, nil
+	// List all available capabilities so the user can see what's there
+	available := []string{}
+	for cap := range cachedCapabilities {
+		available = append(available, cap)
+	}
+
+	return m{
+		"supported":             false,
+		"message":               "No Sieve capability found. Checked: urn:ietf:params:jmap:sieve, https://www.fastmail.com/dev/sieve",
+		"availableCapabilities": available,
+	}, nil
 }
