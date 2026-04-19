@@ -633,7 +633,7 @@ func unsubscribeList(params m) (any, error) {
 	req, _ := http.NewRequest("POST", unsubURL, strings.NewReader("List-Unsubscribe=One-Click"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	data, statusCode, err := doHTTPWithRetry(req, 1)
+	_, statusCode, err := doHTTPWithRetry(req, 1)
 	if err != nil {
 		return nil, errToolError("Unsubscribe request failed: " + err.Error())
 	}
@@ -646,10 +646,8 @@ func unsubscribeList(params m) (any, error) {
 	if statusCode >= 200 && statusCode < 300 {
 		result["message"] = "Unsubscribe request accepted"
 	} else {
+		// Only return status code — never include response body (could leak internal data)
 		result["message"] = fmt.Sprintf("Server returned HTTP %d — unsubscribe may not have succeeded", statusCode)
-		if len(data) > 0 && len(data) < 500 {
-			result["response"] = string(data)
-		}
 	}
 	return result, nil
 }
