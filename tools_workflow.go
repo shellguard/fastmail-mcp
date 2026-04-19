@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -168,12 +169,7 @@ func getMailboxStats(params m) (any, error) {
 	for email, count := range senderCounts {
 		senders = append(senders, senderEntry{email, senderNames[email], count})
 	}
-	// Simple insertion sort for top-N (good enough for ≤1000 unique senders)
-	for i := 1; i < len(senders); i++ {
-		for j := i; j > 0 && senders[j].Count > senders[j-1].Count; j-- {
-			senders[j], senders[j-1] = senders[j-1], senders[j]
-		}
-	}
+	sort.Slice(senders, func(i, j int) bool { return senders[i].Count > senders[j].Count })
 	topSenders := make([]m, 0, 50)
 	for i, s := range senders {
 		if i >= 50 {
@@ -195,11 +191,7 @@ func getMailboxStats(params m) (any, error) {
 	for domain, count := range domainCounts {
 		domains = append(domains, domainEntry{domain, count})
 	}
-	for i := 1; i < len(domains); i++ {
-		for j := i; j > 0 && domains[j].Count > domains[j-1].Count; j-- {
-			domains[j], domains[j-1] = domains[j-1], domains[j]
-		}
-	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i].Count > domains[j].Count })
 	topDomains := make([]m, 0, 30)
 	for i, d := range domains {
 		if i >= 30 {
@@ -334,11 +326,7 @@ func findDuplicates(params m) (any, error) {
 	}
 
 	// Sort by group size descending (biggest duplicate clusters first)
-	for i := 1; i < len(duplicates); i++ {
-		for j := i; j > 0 && len(duplicates[j].Entries) > len(duplicates[j-1].Entries); j-- {
-			duplicates[j], duplicates[j-1] = duplicates[j-1], duplicates[j]
-		}
-	}
+	sort.Slice(duplicates, func(i, j int) bool { return len(duplicates[i].Entries) > len(duplicates[j].Entries) })
 
 	// Cap output to 100 groups
 	if len(duplicates) > 100 {
@@ -521,11 +509,7 @@ func detectNewsletters(params m) (any, error) {
 	for k, v := range lists {
 		sorted = append(sorted, listEntry{k, v})
 	}
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j].Info.Count > sorted[j-1].Info.Count; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Info.Count > sorted[j].Info.Count })
 
 	out := make([]m, 0, len(sorted))
 	for _, entry := range sorted {
@@ -804,11 +788,7 @@ func analyzeSender(params m) (any, error) {
 	for s, c := range subjects {
 		topSubjects = append(topSubjects, subjEntry{s, c})
 	}
-	for i := 1; i < len(topSubjects); i++ {
-		for j := i; j > 0 && topSubjects[j].Count > topSubjects[j-1].Count; j-- {
-			topSubjects[j], topSubjects[j-1] = topSubjects[j-1], topSubjects[j]
-		}
-	}
+	sort.Slice(topSubjects, func(i, j int) bool { return topSubjects[i].Count > topSubjects[j].Count })
 	topSubjOut := make([]m, 0, 10)
 	for i, s := range topSubjects {
 		if i >= 10 {

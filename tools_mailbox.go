@@ -40,6 +40,7 @@ func createMailbox(params m) (any, error) {
 				getString(errObj, "type"), getString(errObj, "description")))
 		}
 	}
+	clearMailboxRoleCache()
 	if created, ok := data["created"].(map[string]any); ok {
 		if mb, ok := created["mb0"].(map[string]any); ok {
 			return m{"status": "created", "id": getString(mb, "id"), "name": name}, nil
@@ -91,6 +92,7 @@ func renameMailbox(params m) (any, error) {
 				getString(errObj, "type"), getString(errObj, "description")))
 		}
 	}
+	clearMailboxRoleCache()
 	return m{"status": "ok", "id": id}, nil
 }
 
@@ -130,6 +132,7 @@ func deleteMailbox(params m) (any, error) {
 				getString(errObj, "type"), getString(errObj, "description")))
 		}
 	}
+	clearMailboxRoleCache()
 	return m{"status": "deleted", "id": id}, nil
 }
 

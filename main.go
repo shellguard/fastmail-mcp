@@ -119,7 +119,7 @@ func handleMessage(msg m, enc *json.Encoder) {
 			return
 		}
 
-		jsonBytes, err := json.MarshalIndent(result, "", "  ")
+		jsonBytes, err := json.Marshal(result)
 		if err != nil {
 			send(m{
 				"content": []m{{"type": "text", "text": fmt.Sprintf("%v", result)}},

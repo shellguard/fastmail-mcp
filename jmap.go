@@ -215,14 +215,19 @@ func jmapCall(methodCalls []any, caps []string) ([]any, error) {
 }
 
 func doHTTPWithRetry(req *http.Request, maxRetries int) ([]byte, int, error) {
+	// Capture body once for retries using GetBody (avoids re-reading on each attempt)
 	var bodyBytes []byte
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if bodyBytes != nil {
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		if req.GetBody != nil {
+			req.Body, _ = req.GetBody()
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -408,8 +413,26 @@ func blobDownloadURL(accountID, blobID, name, mimeType string) string {
 	return r.Replace(tpl)
 }
 
+// cachedMailboxRoles caches role → mailboxId lookups for the process lifetime.
+// Invalidated by clearMailboxRoleCache (called on mailbox create/rename/delete).
+var cachedMailboxRoles = map[string]string{}
+
+func clearMailboxRoleCache() {
+	sessionMu.Lock()
+	cachedMailboxRoles = map[string]string{}
+	sessionMu.Unlock()
+}
+
 // findMailboxByRole finds a mailbox ID by its role (inbox, junk, archive, trash, etc.)
 func findMailboxByRole(acct, role string) (string, error) {
+	// Check cache first
+	sessionMu.Lock()
+	if id, ok := cachedMailboxRoles[role]; ok {
+		sessionMu.Unlock()
+		return id, nil
+	}
+	sessionMu.Unlock()
+
 	responses, err := jmapCall([]any{
 		[]any{"Mailbox/query", m{"accountId": acct, "filter": m{"role": role}}, "mq0"},
 		[]any{"Mailbox/get", m{
@@ -433,5 +456,11 @@ func findMailboxByRole(acct, role string) (string, error) {
 	if id == "" {
 		return "", errToolError(fmt.Sprintf("Could not find %s mailbox", role))
 	}
+
+	// Cache for future lookups
+	sessionMu.Lock()
+	cachedMailboxRoles[role] = id
+	sessionMu.Unlock()
+
 	return id, nil
 }
