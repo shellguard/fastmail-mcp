@@ -131,6 +131,27 @@ func TestHandleMessage_Initialize(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_Initialize_Negotiation(t *testing.T) {
+	// Client requests an older version
+	resp := captureMessage(m{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": m{
+			"protocolVersion": "2024-10-01",
+		},
+	})
+
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result map")
+	}
+	// Server should agree to the older version if it supports it (simulated here by accepting any < latest)
+	if result["protocolVersion"] != "2024-10-01" {
+		t.Errorf("expected negotiated version 2024-10-01, got %v", result["protocolVersion"])
+	}
+}
+
 func TestHandleMessage_Ping(t *testing.T) {
 	resp := captureMessage(m{
 		"jsonrpc": "2.0",

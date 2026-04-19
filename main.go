@@ -61,9 +61,12 @@ func run() {
 	}
 }
 
+const LATEST_PROTOCOL_VERSION = "2024-11-05"
+
 func handleMessage(msg m, enc *json.Encoder) {
 	id := msg["id"]
 	method := getString(msg, "method")
+	params := getMap(msg, "params")
 
 	send := func(result m) {
 		if id == nil {
@@ -81,14 +84,28 @@ func handleMessage(msg m, enc *json.Encoder) {
 
 	switch method {
 	case "initialize":
+		clientVersion := getString(params, "protocolVersion")
+		// Simple negotiation: if client requests a version, we'd ideally match it.
+		// For now, we only support 2024-11-05.
+		version := LATEST_PROTOCOL_VERSION
+		if clientVersion != "" && clientVersion < LATEST_PROTOCOL_VERSION {
+			version = clientVersion
+		}
+
 		send(m{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    m{"tools": m{"listChanged": false}},
-			"serverInfo":      m{"name": "fastmail-mcp", "version": version},
+			"protocolVersion": version,
+			"capabilities": m{
+				"tools": m{"listChanged": false},
+			},
+			"serverInfo": m{"name": "fastmail-mcp", "version": version},
 		})
 
 	case "notifications/initialized":
-		// no response
+		// Protocol: Client confirms it has received the initialize response.
+		// We can use this to start background workers if needed.
+
+	case "ping":
+		send(m{})
 
 	case "tools/list":
 		toolList := make([]m, len(tools))
@@ -131,9 +148,6 @@ func handleMessage(msg m, enc *json.Encoder) {
 			"content": []m{{"type": "text", "text": string(jsonBytes)}},
 			"isError": false,
 		})
-
-	case "ping":
-		send(m{})
 
 	default:
 		sendErr(-32601, "Method not found: "+method)
