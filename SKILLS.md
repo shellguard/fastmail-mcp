@@ -6,6 +6,21 @@ This document teaches an AI agent how to orchestrate the 56 fastmail-mcp tools f
 
 ---
 
+## Known Limitations (Fastmail API Token Scopes)
+
+Fastmail's public API tokens support: **Email, Email submission, Contacts, Masked Email**.
+
+The following are **NOT available** via public API tokens (as of 2026):
+- **Sieve filter management** — use Fastmail web UI (Settings > Filters & Rules) instead
+- **Calendar** — use Fastmail web UI or CalDAV instead
+- **MDN (read receipts)** — untested, may not be available
+
+The Sieve and Calendar tools exist in the MCP server for forward compatibility. They will return
+clear errors explaining the limitation. When a user asks for Sieve rules, **write the rules for them
+and instruct them to paste the rules into Fastmail's web UI** rather than attempting the API.
+
+---
+
 ## Core Principles
 
 1. **Reconnaissance before action.** Always scan before bulk-modifying. Use `fm_get_mailbox_stats` or `fm_list_email_ids` to understand the landscape before moving, deleting, or reporting.
@@ -189,6 +204,12 @@ fm_find_duplicates(mailboxId=...) → for each relevant mailbox
 ## Playbook: Sieve Rule Authoring
 
 **When the user says:** "Create a filter for...", "Auto-sort my email", "Block emails from..."
+
+> **Important:** Fastmail does not currently expose Sieve via public API tokens.
+> If `fm_get_sieve_capabilities` returns `supported: false`, **write the Sieve script
+> for the user and instruct them to paste it into Fastmail web UI** at
+> Settings > Filters & Rules > Edit custom Sieve. The cookbook below is still
+> valuable — you're authoring the script, just not deploying it via API.
 
 ### Step 1: Check capabilities
 
@@ -555,6 +576,10 @@ keep;
 
 **When the user says:** "What's on my calendar?", "Schedule a meeting", "Cancel the event"
 
+> **Note:** Fastmail does not currently expose Calendar via public API tokens.
+> Calendar tools will return errors. Direct the user to the Fastmail web UI
+> or a CalDAV client until Fastmail adds calendar scopes to their token model.
+
 ### Viewing
 
 ```
@@ -841,12 +866,15 @@ Present the list and ask which category each falls into:
 ### Step 3: For legitimate unsubscribes
 
 ```
-# Only if canOneClickUnsubscribe=true
 fm_unsubscribe_list(emailId=sampleId)
-→ Sends RFC 8058 POST to the sender's unsubscribe endpoint
+→ If canOneClickUnsubscribe=true: sends RFC 8058 POST
+→ If canOneClickUnsubscribe=false: returns the manual unsubscribe URL
 ```
 
-If `canOneClickUnsubscribe=false`, tell the user they need to visit the URL manually or use `fm_report_spam` if it's unwanted.
+**Reality check:** Most newsletters do NOT support RFC 8058 one-click unsubscribe.
+The tool will usually return `status: "unsupported"` with a `unsubscribeUrl` the user
+can visit in their browser. Present this URL to the user. For untrusted senders,
+skip unsubscribe entirely and use `fm_report_spam`.
 
 ### Step 4: For spam newsletters
 

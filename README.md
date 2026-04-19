@@ -35,7 +35,9 @@ Download a pre-built binary from [Releases](https://github.com/shellguard/fastma
 
 Go to **Fastmail > Settings > Privacy & Security > API tokens > New API token**.
 
-Required scopes: **Mail, Contacts, Calendars, Submission**.
+Enable all available scopes: **Email, Email submission, Contacts and contact groups, Masked Email**.
+
+> **Note:** Fastmail's public API tokens do not currently support Calendar or Sieve filter scopes. Calendar and Sieve tools are included for forward compatibility but will return clear errors until Fastmail expands their token scope model.
 
 ### 2. Register with Claude Desktop
 
@@ -151,10 +153,10 @@ Claude: [runs fm_list_calendars, fm_create_event with title, time, duration, par
 | VacationResponse | get, set |
 | ContactCard | get, query, set |
 | AddressBook | get, set |
-| Calendar | get, set |
-| CalendarEvent | get, query, set |
+| Calendar | get, set | *not in public token scopes* |
+| CalendarEvent | get, query, set | *not in public token scopes* |
 | MaskedEmail | get, set |
-| SieveScript | get, set, validate |
+| SieveScript | get, set, validate | *not in public token scopes* |
 | Quota | get |
 | MDN | send, parse |
 

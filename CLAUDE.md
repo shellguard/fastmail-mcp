@@ -38,7 +38,11 @@ go install github.com/shellguard/fastmail-mcp@latest
 
 Set `FASTMAIL_TOKEN` environment variable with a Fastmail API token.
 Generate one at: Fastmail → Settings → Privacy & Security → API tokens → New API token.
-Required scopes: **Mail, Contacts, Calendars, Submission**.
+Required scopes: **Email, Email submission, Contacts and contact groups, Masked Email**.
+
+**Note:** Fastmail's public API tokens do NOT support Calendar or Sieve scopes.
+Calendar and Sieve tools are included for forward compatibility but will return
+errors until Fastmail exposes these capabilities to third-party tokens.
 
 ## Architecture
 
@@ -193,18 +197,18 @@ All JMAP calls follow this pattern:
 
 ## JMAP Capabilities Used
 
-| Domain | Capability URN |
-|--------|---------------|
-| Core | `urn:ietf:params:jmap:core` |
-| Mail | `urn:ietf:params:jmap:mail` |
-| Submission | `urn:ietf:params:jmap:submission` |
-| Vacation | `urn:ietf:params:jmap:vacationresponse` |
-| Quota | `urn:ietf:params:jmap:quota` |
-| Contacts | `https://www.fastmail.com/dev/contacts` |
-| Calendars | `https://www.fastmail.com/dev/calendars` |
-| Masked Email | `https://www.fastmail.com/dev/maskedemail` |
-| Sieve | `urn:ietf:params:jmap:sieve` (RFC 9661) |
-| MDN | `urn:ietf:params:jmap:mdn` (RFC 9007) |
+| Domain | Capability URN | API Token Support |
+|--------|---------------|-------------------|
+| Core | `urn:ietf:params:jmap:core` | Yes |
+| Mail | `urn:ietf:params:jmap:mail` | Yes (Email scope) |
+| Submission | `urn:ietf:params:jmap:submission` | Yes (Email submission scope) |
+| Vacation | `urn:ietf:params:jmap:vacationresponse` | Yes (Email scope) |
+| Quota | `urn:ietf:params:jmap:quota` | Yes |
+| Contacts | `https://www.fastmail.com/dev/contacts` | Yes (Contacts scope) |
+| Masked Email | `https://www.fastmail.com/dev/maskedemail` | Yes (Masked Email scope) |
+| Calendars | `https://www.fastmail.com/dev/calendars` | **No** — not in public API token scopes |
+| Sieve | `urn:ietf:params:jmap:sieve` (RFC 9661) | **No** — not in public API token scopes |
+| MDN | `urn:ietf:params:jmap:mdn` (RFC 9007) | Untested |
 
 ## AI Playbooks
 
