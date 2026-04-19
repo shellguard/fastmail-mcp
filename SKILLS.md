@@ -223,65 +223,331 @@ fm_validate_sieve_script(content=newScript)
 fm_set_sieve_script(content=newScript, name="my-filters", activate=true)
 ```
 
-### Sieve patterns reference
+### Sieve Cookbook
 
-**File to folder:**
+Always call `fm_get_sieve_capabilities` first to confirm which extensions are available. Always `fm_validate_sieve_script` before `fm_set_sieve_script`.
+
+When merging with an existing script:
+1. `fm_list_sieve_scripts` to find the active script
+2. `fm_get_sieve_script` to read its content
+3. Merge `require` statements (union of both)
+4. Add new rules at the appropriate position (specific before general)
+5. `fm_validate_sieve_script` the merged result
+6. `fm_set_sieve_script` with the active script's ID + `activate=true`
+
+#### Filing by sender
+
 ```sieve
 require ["fileinto"];
-if address :contains "from" "github.com" { fileinto "Dev/GitHub"; stop; }
-```
 
-**Using JMAP filter syntax (Fastmail-specific, very powerful):**
-```sieve
-require ["fileinto", "vnd.cyrus.jmapquery"];
-if jmapquery "{\"from\":\"@marketing.example.com\",\"hasAttachment\":false}" {
+# Single sender
+if address :is "from" "notifications@github.com" {
+    fileinto "Dev/GitHub";
+    stop;
+}
+
+# Entire domain
+if address :matches "from" "*@company.com" {
+    fileinto "Work";
+    stop;
+}
+
+# Multiple senders to one folder
+if address :is "from" ["news@a.com", "digest@b.com", "weekly@c.com"] {
     fileinto "Newsletters";
     stop;
 }
 ```
 
-**Flag and keep in inbox:**
-```sieve
-require ["imap4flags"];
-if address :is "from" "boss@company.com" {
-    addflag "\\Flagged";
-}
-```
+#### Filing by subject pattern
 
-**Reject with message:**
 ```sieve
-require ["reject"];
-if address :matches "from" "*@blocked-domain.com" {
-    reject "Message refused.";
+require ["fileinto"];
+
+if header :contains "subject" "[JIRA]" {
+    fileinto "Work/Jira";
     stop;
 }
 ```
 
-**Vacation auto-responder (alternative to fm_set_vacation_response):**
+#### Filing with regex (powerful pattern matching)
+
+```sieve
+require ["fileinto", "regex"];
+
+# Match order confirmations
+if header :regex "subject" "(?i)(order confirm|order #|your order|purchase receipt)" {
+    fileinto "Shopping/Orders";
+    stop;
+}
+
+# Match shipping notifications
+if header :regex "subject" "(?i)(shipped|tracking|delivery|out for delivery)" {
+    fileinto "Shopping/Shipping";
+    stop;
+}
+```
+
+#### Using JMAP filter syntax (Fastmail-specific — very powerful)
+
+The `vnd.cyrus.jmapquery` extension lets you use the full JMAP Email/query filter syntax inside Sieve. This is the most powerful filtering method available.
+
+```sieve
+require ["fileinto", "vnd.cyrus.jmapquery"];
+
+# Complex filter: from marketing domain, no attachments
+if jmapquery "{\"from\":\"@marketing.example.com\",\"hasAttachment\":false}" {
+    fileinto "Newsletters";
+    stop;
+}
+
+# Filter by multiple conditions
+if jmapquery "{\"operator\":\"AND\",\"conditions\":[{\"from\":\"@github.com\"},{\"subject\":\"pull request\"}]}" {
+    fileinto "Dev/PRs";
+    stop;
+}
+
+# Large emails (> 5MB) to a separate folder
+if jmapquery "{\"minSize\":5242880}" {
+    fileinto "Large Emails";
+    stop;
+}
+```
+
+#### Spam and blocking
+
+```sieve
+require ["fileinto", "reject"];
+
+# Block specific domains (silent discard)
+if address :matches "from" ["*@spam-domain.biz", "*@scam-corp.ru"] {
+    discard;
+    stop;
+}
+
+# Block with bounce message
+if address :matches "from" "*@blocked.com" {
+    reject "Messages from this sender are not accepted.";
+    stop;
+}
+
+# Move suspected spam to Junk (let user review)
+if header :contains "X-Spam-Score" "5" {
+    fileinto "Junk";
+    stop;
+}
+
+# High-confidence spam — silent discard
+if header :contains "X-Spam-Score" "10" {
+    discard;
+    stop;
+}
+```
+
+#### Flagging and labeling
+
+```sieve
+require ["imap4flags"];
+
+# Flag emails from VIPs
+if address :is "from" ["boss@company.com", "ceo@company.com"] {
+    addflag "\\Flagged";
+    keep;
+    stop;
+}
+
+# Mark mailing list emails as read (file and don't clutter unread count)
+if exists "List-Id" {
+    addflag "\\Seen";
+}
+```
+
+#### Auto-forward / redirect
+
+```sieve
+require ["copy"];
+
+# Forward a copy (keep original in mailbox)
+if address :is "to" "support@mycompany.com" {
+    redirect :copy "team@mycompany.com";
+}
+
+# Redirect without keeping (no local copy)
+if address :is "to" "old@mycompany.com" {
+    redirect "new@mycompany.com";
+    stop;
+}
+```
+
+#### Vacation auto-responder
+
 ```sieve
 require ["vacation"];
-vacation :days 7 :subject "Out of Office"
-    "I'm currently unavailable. I'll respond when I return.";
+
+vacation :days 7
+    :subject "Out of Office"
+    "I'm away until April 28. For urgent matters, contact backup@company.com.";
 ```
 
-**Discard silently (use sparingly):**
-```sieve
-if header :contains "X-Spam-Score" "10" { discard; stop; }
-```
+#### Deduplication (prevent duplicate deliveries)
 
-**Deduplicate incoming (prevent future duplicates):**
 ```sieve
 require ["duplicate"];
+
+if duplicate {
+    discard;
+    stop;
+}
+```
+
+#### Snooze incoming emails (Fastmail-specific)
+
+```sieve
+require ["vnd.cyrus.snooze", "fileinto", "imap4flags"];
+
+# Snooze overnight delivery notifications until morning
+if allof(
+    currentdate :zone "+0000" :value "ge" "hour" "22",
+    address :matches "from" "*@shipping.com"
+) {
+    snooze :mailbox "INBOX" :addflags "\\Flagged" "08:00";
+    stop;
+}
+```
+
+#### Combining multiple conditions (AND/OR/NOT)
+
+```sieve
+require ["fileinto"];
+
+# AND: both conditions must match
+if allof(
+    address :contains "from" "alerts@",
+    header :contains "subject" "CRITICAL"
+) {
+    fileinto "Alerts/Critical";
+    stop;
+}
+
+# OR: either condition matches
+if anyof(
+    address :contains "from" "noreply@",
+    address :contains "from" "no-reply@"
+) {
+    fileinto "Automated";
+    stop;
+}
+
+# NOT: exclude a condition
+if allof(
+    address :matches "from" "*@company.com",
+    not header :contains "subject" "[URGENT]"
+) {
+    fileinto "Work/Non-Urgent";
+    stop;
+}
+```
+
+#### Variables (dynamic content)
+
+```sieve
+require ["fileinto", "variables"];
+
+# Extract domain from sender and file into domain-named folder
+if address :matches "from" "*@*" {
+    set "domain" "${2}";
+    fileinto "By-Domain/${domain}";
+    stop;
+}
+```
+
+#### Edit headers (Fastmail-specific)
+
+```sieve
+require ["editheader"];
+
+# Add a custom header for processing
+if address :contains "from" "automated@" {
+    addheader "X-Auto-Filed" "true";
+}
+
+# Remove tracking headers
+deleteheader "X-Mailer";
+```
+
+#### Complete antispam + organization script template
+
+This is a full production-ready Sieve script combining multiple techniques:
+
+```sieve
+require ["fileinto", "reject", "regex", "imap4flags", "duplicate",
+         "vnd.cyrus.jmapquery", "variables"];
+
+# === 1. Deduplication (first, before all other rules) ===
 if duplicate { discard; stop; }
+
+# === 2. Blocklist (hard block — silent discard) ===
+if address :matches "from" [
+    "*@spam-domain.biz",
+    "*@known-scammer.ru"
+] {
+    discard;
+    stop;
+}
+
+# === 3. VIP senders (flag + keep in inbox) ===
+if address :is "from" [
+    "boss@company.com",
+    "wife@family.com"
+] {
+    addflag "\\Flagged";
+    keep;
+    stop;
+}
+
+# === 4. Work routing ===
+if address :matches "from" "*@company.com" {
+    if header :contains "subject" "[JIRA]" {
+        fileinto "Work/Jira"; stop;
+    }
+    if header :contains "subject" "[PR]" {
+        fileinto "Work/PRs"; stop;
+    }
+    fileinto "Work"; stop;
+}
+
+# === 5. Developer notifications ===
+if address :is "from" "notifications@github.com" {
+    fileinto "Dev/GitHub"; stop;
+}
+
+# === 6. Shopping & orders ===
+if header :regex "subject" "(?i)(order confirm|tracking|shipped|delivery)" {
+    fileinto "Shopping"; stop;
+}
+
+# === 7. Newsletters (has List-Id header) ===
+if exists "List-Id" {
+    addflag "\\Seen";
+    fileinto "Newsletters";
+    stop;
+}
+
+# === 8. Catch-all: everything else stays in Inbox ===
+keep;
 ```
 
 ### Important Sieve rules
 
-- `stop;` prevents further rule processing — always include it after terminal actions.
+- `stop;` prevents further rule processing — always include it after terminal actions like `fileinto` or `discard`.
 - Rules are evaluated top-to-bottom. Put specific rules before general ones.
-- `require` statements must be at the top, before any rules.
-- Multiple `require` extensions can be combined: `require ["fileinto", "reject", "regex"];`
-- When merging with existing scripts, preserve all existing `require` statements and add new ones.
+- `require` statements must ALL be at the top, before any rules. Combine them: `require ["fileinto", "reject", "regex"];`
+- When merging with existing scripts, take the union of all `require` statements.
+- `keep;` is implicit if no other action is taken — including it explicitly is optional but clear.
+- `discard;` is permanent — the email is gone. Use `fileinto "Junk"` if the user should be able to review.
+- Use `allof()` for AND, `anyof()` for OR, `not` for negation.
+- `:is` = exact match, `:contains` = substring, `:matches` = glob (* and ?), `:regex` = regular expression.
+- Address tests work on structured email addresses. Header tests work on raw header values.
 
 ---
 
