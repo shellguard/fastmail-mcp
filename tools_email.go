@@ -851,6 +851,9 @@ func importEmail(params m) (any, error) {
 
 	keywords := getMap(params, "keywords")
 	if keywords != nil {
+		if err := validateKeywords(keywords); err != nil {
+			return nil, err
+		}
 		importObj["keywords"] = keywords
 	}
 	if ra := getString(params, "receivedAt"); ra != "" {

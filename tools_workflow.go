@@ -617,7 +617,7 @@ func unsubscribeList(params m) (any, error) {
 	req, _ := http.NewRequest("POST", unsubURL, strings.NewReader("List-Unsubscribe=One-Click"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	_, statusCode, err := doHTTPWithRetry(req, 1)
+	_, statusCode, err := doHTTPWithRetryLong(req, 1)
 	if err != nil {
 		return nil, errToolError("Unsubscribe request failed: " + err.Error())
 	}

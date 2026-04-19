@@ -368,6 +368,16 @@ func intParamMin1(params m, key string, defaultVal, maxVal int) int {
 	return v
 }
 
+// validateKeywords checks that all keys in a keyword map match RFC 8621 syntax.
+func validateKeywords(keywords m) error {
+	for k := range keywords {
+		if !validKeywordRe.MatchString(k) {
+			return errInvalidParams(fmt.Sprintf("keyword %q contains invalid characters (must be letters, digits, $, _, -)", k))
+		}
+	}
+	return nil
+}
+
 func contains(ss []string, s string) bool {
 	for _, x := range ss {
 		if x == s {

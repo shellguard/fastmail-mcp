@@ -25,7 +25,8 @@ var (
 	cachedFallbackAccount  string
 	cachedCapabilities     = map[string]bool{} // all capability URNs the server advertises
 	cachedCapabilityData   = map[string]m{}    // full capability objects (for reading sieveExtensions etc.)
-	httpClient             = &http.Client{Timeout: 90 * time.Second}
+	httpClient             = &http.Client{Timeout: 30 * time.Second}  // read-only operations
+	httpClientLong         = &http.Client{Timeout: 90 * time.Second}  // uploads, sends, scans
 )
 
 func bearerToken() (string, error) {
@@ -214,7 +215,15 @@ func jmapCall(methodCalls []any, caps []string) ([]any, error) {
 	return responses, nil
 }
 
+func doHTTPWithRetryLong(req *http.Request, maxRetries int) ([]byte, int, error) {
+	return doHTTPWithRetryUsing(req, maxRetries, httpClientLong)
+}
+
 func doHTTPWithRetry(req *http.Request, maxRetries int) ([]byte, int, error) {
+	return doHTTPWithRetryUsing(req, maxRetries, httpClient)
+}
+
+func doHTTPWithRetryUsing(req *http.Request, maxRetries int, client *http.Client) ([]byte, int, error) {
 	// Capture body once for retries using GetBody (avoids re-reading on each attempt)
 	var bodyBytes []byte
 	if req.Body != nil {
@@ -229,7 +238,7 @@ func doHTTPWithRetry(req *http.Request, maxRetries int) ([]byte, int, error) {
 		if req.GetBody != nil {
 			req.Body, _ = req.GetBody()
 		}
-		resp, err := httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, 0, errToolError("HTTP request failed: " + err.Error())
 		}
@@ -347,7 +356,7 @@ func uploadBlob(accountID, content, contentType string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", contentType)
 
-	data, statusCode, err := doHTTPWithRetry(req, 1)
+	data, statusCode, err := doHTTPWithRetryLong(req, 1)
 	if err != nil {
 		return "", err
 	}
@@ -382,7 +391,7 @@ func downloadBlobText(accountID, blobID string) (string, error) {
 	req, _ := http.NewRequest("GET", dlURL, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	data, statusCode, err := doHTTPWithRetry(req, 1)
+	data, statusCode, err := doHTTPWithRetryLong(req, 1)
 	if err != nil {
 		return "", err
 	}
