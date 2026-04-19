@@ -155,17 +155,31 @@ func TestIntParam_CapsAtMax(t *testing.T) {
 	}
 }
 
-func TestIntParam_NegativeFloorsAtOne(t *testing.T) {
+func TestIntParam_NegativeFloorsAtZero(t *testing.T) {
 	result := intParam(m{"offset": float64(-5)}, "offset", 0, 0)
-	if result != 1 {
-		t.Errorf("intParam negative: got %d, want 1", result)
+	if result != 0 {
+		t.Errorf("intParam negative: got %d, want 0", result)
 	}
 }
 
-func TestIntParam_ZeroFloorsAtOne(t *testing.T) {
-	result := intParam(m{"maxScan": float64(0)}, "maxScan", 500, 1000)
+func TestIntParam_ZeroAllowed(t *testing.T) {
+	result := intParam(m{"offset": float64(0)}, "offset", 0, 0)
+	if result != 0 {
+		t.Errorf("intParam zero offset: got %d, want 0", result)
+	}
+}
+
+func TestIntParamMin1_FloorsAtOne(t *testing.T) {
+	result := intParamMin1(m{"maxScan": float64(0)}, "maxScan", 500, 1000)
 	if result != 1 {
-		t.Errorf("intParam zero: got %d, want 1", result)
+		t.Errorf("intParamMin1 zero: got %d, want 1", result)
+	}
+}
+
+func TestIntParamMin1_NegativeFloorsAtOne(t *testing.T) {
+	result := intParamMin1(m{"maxScan": float64(-10)}, "maxScan", 500, 1000)
+	if result != 1 {
+		t.Errorf("intParamMin1 negative: got %d, want 1", result)
 	}
 }
 

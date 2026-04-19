@@ -350,11 +350,20 @@ func intParam(params m, key string, defaultVal, maxVal int) int {
 	if f, ok := params[key].(float64); ok {
 		v = int(f)
 	}
-	if v < 1 {
-		v = 1
+	if v < 0 {
+		v = 0
 	}
 	if maxVal > 0 && v > maxVal {
 		v = maxVal
+	}
+	return v
+}
+
+// intParamMin1 is like intParam but floors at 1 (for counts/scan limits, not offsets).
+func intParamMin1(params m, key string, defaultVal, maxVal int) int {
+	v := intParam(params, key, defaultVal, maxVal)
+	if v < 1 {
+		v = 1
 	}
 	return v
 }

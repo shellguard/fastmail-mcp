@@ -55,7 +55,7 @@ func getMailboxStats(params m) (any, error) {
 	if mailboxID == "" {
 		return nil, errInvalidParams("mailboxId is required")
 	}
-	maxScan := intParam(params, "maxScan", 500, 1000)
+	maxScan := intParamMin1(params, "maxScan", 500, 1000)
 	onlyUnread := getBool(params, "onlyUnread")
 
 	acct, err := mailAccountID()
@@ -229,7 +229,7 @@ func findDuplicates(params m) (any, error) {
 	if mailboxID == "" {
 		return nil, errInvalidParams("mailboxId is required")
 	}
-	maxScan := intParam(params, "maxScan", 1000, 5000)
+	maxScan := intParamMin1(params, "maxScan", 1000, 5000)
 
 	acct, err := mailAccountID()
 	if err != nil {
@@ -392,7 +392,7 @@ func detectNewsletters(params m) (any, error) {
 	if mailboxID == "" {
 		return nil, errInvalidParams("mailboxId is required")
 	}
-	maxScan := intParam(params, "maxScan", 500, 2000)
+	maxScan := intParamMin1(params, "maxScan", 500, 2000)
 
 	acct, err := mailAccountID()
 	if err != nil {
@@ -665,7 +665,7 @@ func analyzeSender(params m) (any, error) {
 		return nil, err
 	}
 
-	maxScan := intParam(params, "maxScan", 200, 500)
+	maxScan := intParamMin1(params, "maxScan", 200, 500)
 
 	// Search for all emails from this sender
 	responses, err := jmapCall([]any{
@@ -858,7 +858,7 @@ func findUnreplied(params m) (any, error) {
 		return nil, err
 	}
 
-	maxScan := intParam(params, "maxScan", 200, 500)
+	maxScan := intParamMin1(params, "maxScan", 200, 500)
 	daysOld := intParam(params, "daysOld", 3, 90)
 
 	// Calculate the cutoff date
