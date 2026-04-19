@@ -2,10 +2,49 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
+
+// isSafeExternalURL validates that a URL points to a public internet host,
+// blocking SSRF to localhost, private networks, link-local, and cloud metadata IPs.
+func isSafeExternalURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("only HTTPS URLs are allowed")
+	}
+	host := u.Hostname()
+	// Block obvious names
+	if host == "localhost" || host == "" {
+		return fmt.Errorf("localhost URLs are not allowed")
+	}
+	// Resolve and check IP
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve host %q: %v", host, err)
+	}
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("URL resolves to non-public IP %s", ipStr)
+		}
+		// Block cloud metadata IPs (AWS, GCP, Azure)
+		if ipStr == "169.254.169.254" || ipStr == "fd00:ec2::254" {
+			return fmt.Errorf("URL resolves to cloud metadata IP %s", ipStr)
+		}
+	}
+	return nil
+}
 
 // ── Agentic Workflow Tools ───────────────────────────────────────────────────
 
@@ -583,6 +622,11 @@ func unsubscribeList(params m) (any, error) {
 			"message": "List-Unsubscribe header has no HTTPS URL — only mailto. Use fm_report_spam for untrusted senders.",
 			"unsubscribeHeader": unsubHeader,
 		}, nil
+	}
+
+	// Validate URL is safe (not internal/private/metadata — SSRF prevention)
+	if err := isSafeExternalURL(unsubURL); err != nil {
+		return nil, errToolError(fmt.Sprintf("Refusing to POST to unsubscribe URL: %v", err))
 	}
 
 	// Perform the RFC 8058 one-click POST
