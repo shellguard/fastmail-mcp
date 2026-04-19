@@ -1,8 +1,8 @@
 class FastmailMcp < Formula
   desc "MCP server for Fastmail — email, calendar, contacts, Sieve, and more via JMAP"
   homepage "https://github.com/shellguard/fastmail-mcp"
-  url "https://github.com/shellguard/fastmail-mcp/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "ac4b37f05de9f11746756bb253d2b2413eeb9759292cf3ed984dc0272c5e1fd2"
+  url "https://github.com/shellguard/fastmail-mcp/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "9e3f5c79e331bb2e0d609b90024af4a46b1c3abe33fd60a8dd9d07fb3fda15ba"
   license "MIT"
 
   depends_on "go" => :build
@@ -16,7 +16,7 @@ class FastmailMcp < Formula
     <<~EOS
       Create a Fastmail API token at:
         Fastmail > Settings > Privacy & Security > API tokens
-        Required scopes: Mail, Contacts, Calendars, Submission
+        Scopes: Email, Email submission, Contacts, Masked Email
 
       Register with Claude Desktop — add to config:
         {
